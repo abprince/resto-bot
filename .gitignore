@@ -1,0 +1,4 @@
+echo node_modules/ > .gitignore
+echo auth_info_baileys/ >> .gitignore
+echo .env >> .gitignore
+echo *.log >> .gitignore
