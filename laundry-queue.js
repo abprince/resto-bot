@@ -11,7 +11,7 @@ function startLaundryQueue(sendText, isReady = () => true) {
   const KEY = process.env.LM_NODE_KEY || '';
   const POLL_MS = Number(process.env.LM_POLL_MS || 5000);
   if (process.env.LM_ENABLED === 'false') return console.log('[laundry] disabled');
-  if (!BASE || !KEY) return console.error('[laundry] set LM_API_BASE and LM_NODE_KEY');
+    if (!BASE || !KEY) return console.error('[laundry] missing:', [!BASE && 'LM_API_BASE', !KEY && 'LM_NODE_KEY'].filter(Boolean).join(', '));
 
   async function api(path, method = 'GET', body) {
     const res = await fetch(BASE + path, { method, headers: { 'X-Api-Key': KEY, 'Content-Type': 'application/json' }, body: body ? JSON.stringify(body) : undefined });
