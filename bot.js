@@ -5,6 +5,8 @@ const pino = require('pino');
 const fs = require('fs');
 const axios = require('axios');
 require('dotenv').config();
+const { startLaundryQueue } = require('./laundry-queue');
+let laundryStarted = false;
 
 const app = express();
 app.use(express.json());
@@ -439,6 +441,14 @@ async function connectToWhatsApp() {
                 logger.info('✅ WhatsApp connected successfully!');
                 isConnected = true;
                 qrCode = null;
+                
+                if (!laundryStarted) {
+                    laundryStarted = true;
+                    startLaundryQueue(async (phone, message) => {
+                        const ok = await sendWhatsAppMessage(phone, message);
+                        if (!ok) throw new Error('send failed');
+                    }, () => isConnected);
+                }
             }
         });
 
