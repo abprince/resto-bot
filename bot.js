@@ -1,4 +1,4 @@
-// bot.js — multi-tenant WhatsApp bot
+// bot.js — multi-tenant WhatsApp bot for Laundry Man
 //
 // Modes:
 //   SHARED (default)   — one Baileys session serving all tenants from /node/tenants
@@ -35,15 +35,13 @@ const MASTER_KEY = process.env.LM_BOT_MASTER_KEY || '';
 const BOT_MODE = (process.env.LM_BOT_MODE || 'shared').trim();
 const AUTH_ROOT = './auth_sessions';
 const SHARED_AUTH_DIR = path.join(AUTH_ROOT, 'shared');
-const AUTH_FOLDER_LEGACY = './auth_info_baileys';   // used only by Resto Bot's manual send endpoint
 
 // ==================== STATE ====================
-let sharedSock = null;          // the one shared WhatsApp socket
+let sharedSock = null;
 let sharedConnected = false;
 let sharedQr = null;
-const tenantQueues = new Map(); // tenantId → stop function
-
-const perTenantSessions = new Map(); // tenantId → { sock, connected, qr, queueStop }
+const tenantQueues = new Map();
+const perTenantSessions = new Map();
 
 // ==================== LOGGER ====================
 const logger = pino({
@@ -64,6 +62,10 @@ function formatPhoneNumber(phone) {
   return cleaned;
 }
 
+function isPerTenantMode() {
+  return BOT_MODE === 'per_tenant' && !!(process.env.LM_TENANTS || '').trim();
+}
+
 // ==================== SHARED MODE ====================
 async function startSharedSession() {
   if (sharedSock) return;
@@ -78,7 +80,7 @@ async function startSharedSession() {
     version,
     auth: state,
     logger: pino({ level: 'silent' }),
-    browser: ['Laundry Bot', 'Chrome', '1.0.0'],
+    browser: ['Laundry Man Bot', 'Chrome', '1.0.0'],
   });
 
   sharedSock.ev.on('creds.update', saveCreds);
@@ -196,7 +198,7 @@ async function startPerTenantSession(tenantId, apiKey) {
     version,
     auth: state,
     logger: pino({ level: 'silent' }),
-    browser: ['Laundry Bot', 'Chrome', '1.0.0'],
+    browser: ['Laundry Man Bot', 'Chrome', '1.0.0'],
   });
 
   const session = { sock, connected: false, qr: null, queueStop: null };
@@ -242,10 +244,6 @@ async function startPerTenantSession(tenantId, apiKey) {
       }
     }
   });
-}
-
-function isPerTenantMode() {
-  return BOT_MODE === 'per_tenant' && !!(process.env.LM_TENANTS || '').trim();
 }
 
 // ==================== HOMEPAGE ====================
@@ -325,7 +323,6 @@ app.get('/', (req, res) => {
 
 // ==================== QR CODE PAGE ====================
 app.get('/qr', (req, res) => {
-  // In per-tenant mode, redirect to first offline tenant's QR
   if (isPerTenantMode()) {
     const offline = [...perTenantSessions.entries()].find(([_, s]) => !s.connected);
     if (offline) return res.redirect('/qr/' + offline[0]);
@@ -551,10 +548,15 @@ app.get('/qr/:tenantId', (req, res) => {
 });
 
 // ==================== HEALTH CHECK ====================
+// Returns JSON for API clients (PHP dashboard, curl, bots).
+// Returns a nice HTML page for browsers.
+// Force a format with ?format=json or ?format=html
 app.get('/health', (req, res) => {
+  // Build the data payload once
+  let data;
   if (isPerTenantMode()) {
     const connected = [...perTenantSessions.values()].filter(s => s.connected).length;
-    res.json({
+    data = {
       status: 'running',
       mode: 'per_tenant',
       whatsapp_connected: connected > 0 && connected === perTenantSessions.size,
@@ -562,20 +564,162 @@ app.get('/health', (req, res) => {
       tenants_connected: connected,
       uptime: process.uptime(),
       timestamp: new Date().toISOString(),
-    });
+    };
   } else {
-    res.json({
+    data = {
       status: 'running',
       mode: 'shared',
       whatsapp_connected: sharedConnected,
       tenants_served: tenantQueues.size,
       uptime: process.uptime(),
       timestamp: new Date().toISOString(),
-    });
+    };
   }
+
+  // Decide format
+  const forced = (req.query.format || '').toLowerCase();
+  const wantsHtml = forced === 'html'
+    || (forced !== 'json' && (req.headers.accept || '').includes('text/html'));
+
+  if (!wantsHtml) {
+    return res.json(data);
+  }
+
+  // Render HTML page
+  const connected = data.whatsapp_connected;
+  const uptimeMin = Math.floor(data.uptime / 60);
+  const uptimeHr = Math.floor(uptimeMin / 60);
+  const uptimeStr = uptimeHr > 0
+    ? `${uptimeHr}h ${uptimeMin % 60}m`
+    : `${uptimeMin} min`;
+
+  res.send(`
+  <!DOCTYPE html>
+  <html>
+  <head>
+    <title>Health Check — Laundry Man Bot</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+      * { margin: 0; padding: 0; box-sizing: border-box; }
+      body {
+        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+        display: flex; justify-content: center; align-items: center;
+        min-height: 100vh; background: linear-gradient(135deg, #0f766e 0%, #115e59 100%);
+        padding: 1rem;
+      }
+      .container {
+        background: white; padding: 50px 40px; border-radius: 20px;
+        box-shadow: 0 20px 60px rgba(0,0,0,0.3); text-align: center;
+        max-width: 460px; width: 100%;
+      }
+      .icon { font-size: 64px; margin-bottom: 20px; }
+      h1 { color: #1b2b4b; margin-bottom: 10px; font-size: 26px; }
+      p.subtitle { color: #666; margin-bottom: 20px; }
+
+      .status {
+        display: inline-block; padding: 10px 24px; border-radius: 25px;
+        font-size: 15px; font-weight: bold; margin: 15px 0 25px;
+      }
+      .online { background: #e8f5e9; color: #28a745; }
+      .offline { background: #ffeaea; color: #dc3545; }
+
+      .stats {
+        display: grid; gap: .5rem; margin-bottom: 25px; text-align: left;
+      }
+      .stat-row {
+        display: flex; justify-content: space-between; align-items: center;
+        padding: .6rem .9rem; background: #f8fafc; border-radius: 10px;
+        font-size: 14px;
+      }
+      .stat-row .label {
+        color: #94a3b8; font-weight: 600; text-transform: uppercase;
+        letter-spacing: .03em; font-size: 12px;
+      }
+      .stat-row .value {
+        color: #1b2b4b; font-weight: 700; font-family: ui-monospace, monospace;
+        font-size: 13px;
+      }
+
+      .links { display: flex; flex-direction: column; gap: 10px; margin-top: 15px; }
+      .links a {
+        display: block; padding: 12px 24px; background: #0f766e; color: white;
+        text-decoration: none; border-radius: 25px; font-weight: 600;
+        transition: all 0.3s;
+      }
+      .links a:hover { background: #115e59; transform: translateY(-2px); }
+      .links a.home { background: #6c757d; }
+      .links a.home:hover { background: #5a6268; }
+
+      .refresh {
+        font-size: 12px; color: #94a3b8; margin-top: 20px;
+      }
+      .refresh a { color: #0f766e; text-decoration: none; font-weight: 600; }
+      .refresh a:hover { text-decoration: underline; }
+
+      .footer { margin-top: 20px; font-size: 11px; color: #cbd5e1; }
+    </style>
+  </head>
+  <body>
+    <div class="container">
+      <div class="icon">${connected ? '✅' : '⚠️'}</div>
+      <h1>Bot Health</h1>
+      <p class="subtitle">Laundry Man WhatsApp Service</p>
+
+      <span class="status ${connected ? 'online' : 'offline'}">
+        ${connected ? '🟢 Connected' : '🔴 Disconnected'}
+      </span>
+
+      <div class="stats">
+        <div class="stat-row">
+          <span class="label">Status</span>
+          <span class="value">${data.status}</span>
+        </div>
+        <div class="stat-row">
+          <span class="label">Mode</span>
+          <span class="value">${data.mode}</span>
+        </div>
+        <div class="stat-row">
+          <span class="label">WhatsApp</span>
+          <span class="value" style="color:${connected ? '#28a745' : '#dc3545'}">
+            ${connected ? 'Connected' : 'Disconnected'}
+          </span>
+        </div>
+        ${data.mode === 'shared'
+          ? `<div class="stat-row">
+              <span class="label">Tenants served</span>
+              <span class="value">${data.tenants_served}</span>
+            </div>`
+          : `<div class="stat-row">
+              <span class="label">Tenants connected</span>
+              <span class="value">${data.tenants_connected} / ${data.tenants_total}</span>
+            </div>`}
+        <div class="stat-row">
+          <span class="label">Uptime</span>
+          <span class="value">${uptimeStr}</span>
+        </div>
+        <div class="stat-row">
+          <span class="label">Checked at</span>
+          <span class="value">${data.timestamp.slice(11, 19)} UTC</span>
+        </div>
+      </div>
+
+      <div class="links">
+        ${!connected ? `<a href="/qr">📱 Scan QR to Connect</a>` : ''}
+        <a href="/" class="home">🏠 Back to Home</a>
+      </div>
+
+      <p class="refresh">
+        <a href="/health?format=html">🔄 Refresh</a> ·
+        <a href="/health?format=json">View raw JSON</a>
+      </p>
+      <div class="footer">Render Deployed • v2.0</div>
+    </div>
+  </body>
+  </html>
+  `);
 });
 
-// ==================== PER-TENANT STATUS (JSON) ====================
+// ==================== STATUS (JSON) ====================
 app.get('/status', (req, res) => {
   res.json({
     ok: true,
@@ -593,10 +737,7 @@ app.get('/status', (req, res) => {
   });
 });
 
-// ==================== RESTO BOT / MANUAL SEND ENDPOINTS ====================
-// These remain for compatibility with the old Resto Bot use case.
-// They send via the shared socket.
-
+// ==================== RESTAURANT BOT ENDPOINTS (kept for compatibility) ====================
 async function sendWhatsAppMessage(phoneNumber, message) {
   try {
     const sock = isPerTenantMode()
@@ -687,7 +828,7 @@ app.listen(PORT, async () => {
   logger.info(`🚀 Laundry Man Bot server running on port ${PORT}`);
   logger.info(`📍 Homepage: http://localhost:${PORT}`);
   logger.info(`📱 QR Code: http://localhost:${PORT}/qr`);
-  logger.info(`❤️ Health: http://localhost:${PORT}/health`);
+  logger.info(`❤️  Health: http://localhost:${PORT}/health`);
 
   if (isPerTenantMode()) {
     const list = parseTenantList(process.env.LM_TENANTS);
