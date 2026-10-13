@@ -1,480 +1,537 @@
+// bot.js — multi-tenant WhatsApp bot
+//
+// Two modes:
+//   SHARED (default)   — one Baileys session serving all tenants from /node/tenants
+//   PER-TENANT         — LM_TENANTS=1:key,3:key — one session per listed tenant
+//
+// Env:
+//   LM_API_BASE       — PHP API base URL
+//   LM_BOT_MASTER_KEY — master key (required for SHARED mode)
+//   LM_BOT_MODE       — "shared" or "per_tenant" (default: shared)
+//   LM_TENANTS        — comma-separated tenantId:key pairs (PER-TENANT mode)
+//   LM_POLL_MS        — optional, default 30000
+
 const express = require('express');
-const { makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion } = require('@whiskeysockets/baileys');
+const {
+  makeWASocket,
+  useMultiFileAuthState,
+  DisconnectReason,
+  fetchLatestBaileysVersion,
+} = require('@whiskeysockets/baileys');
 const { Boom } = require('@hapi/boom');
 const pino = require('pino');
 const fs = require('fs');
-const axios = require('axios');
+const path = require('path');
 require('dotenv').config();
-const { startLaundryQueue } = require('./laundry-queue');
-let laundryStarted = false;
 
-const app = express();
-app.use(express.json());
+const { startLaundryQueue } = require('./laundry-queue');
 
 const PORT = process.env.PORT || 3000;
-const AUTH_FOLDER = './auth_info_baileys';
+const API_BASE = (process.env.LM_API_BASE || '').replace(/\/$/, '');
+const MASTER_KEY = process.env.LM_BOT_MASTER_KEY || '';
+const BOT_MODE = (process.env.LM_BOT_MODE || 'shared').trim();
+const AUTH_ROOT = './auth_sessions';
+const SHARED_AUTH_DIR = path.join(AUTH_ROOT, 'shared');
 
-// Logger
+if (!API_BASE) {
+  console.error('LM_API_BASE is required');
+  process.exit(1);
+}
+
 const logger = pino({
-    transport: {
-        target: 'pino-pretty',
-        options: { colorize: true }
+  transport: { target: 'pino-pretty', options: { colorize: true } },
+});
+
+let sharedSock = null;
+let sharedConnected = false;
+let sharedQr = null;
+const tenantQueues = new Map();
+const perTenantSessions = new Map();
+
+function ensureDir(dir) {
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+}
+
+// ============================================================
+// SHARED MODE
+// ============================================================
+async function startSharedSession() {
+  if (sharedSock) return;
+  ensureDir(SHARED_AUTH_DIR);
+
+  const { state, saveCreds } = await useMultiFileAuthState(SHARED_AUTH_DIR);
+  const { version } = await fetchLatestBaileysVersion();
+
+  logger.info(`[shared] starting WhatsApp session v${version.join('.')}`);
+
+  sharedSock = makeWASocket({
+    version,
+    auth: state,
+    logger: pino({ level: 'silent' }),
+    browser: ['Laundry Bot', 'Chrome', '1.0.0'],
+  });
+
+  sharedSock.ev.on('creds.update', saveCreds);
+
+  sharedSock.ev.on('connection.update', async (update) => {
+    const { connection, lastDisconnect, qr } = update;
+
+    if (qr) {
+      sharedQr = qr;
+      logger.info('[shared] new QR — scan via /qr');
     }
-});
 
-let sock = null;
-let isConnected = false;
-let qrCode = null;
+    if (connection === 'close') {
+      const statusCode = lastDisconnect?.error instanceof Boom
+        ? lastDisconnect.error.output.statusCode
+        : null;
 
-// ==================== HOMEPAGE ====================
-app.get('/', (req, res) => {
-    res.send(`
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>Resto Bot - Restaurant WhatsApp Service</title>
-        <meta name="viewport" content="width=device-width, initial-scale=1">
-        <style>
-            * { margin: 0; padding: 0; box-sizing: border-box; }
-            body { 
-                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-                display: flex; justify-content: center; align-items: center; 
-                min-height: 100vh; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            }
-            .container { 
-                background: white; padding: 50px 40px; border-radius: 20px; 
-                box-shadow: 0 20px 60px rgba(0,0,0,0.3); text-align: center; max-width: 450px; width: 90%;
-            }
-            .icon { font-size: 64px; margin-bottom: 20px; }
-            h1 { color: #333; margin-bottom: 10px; font-size: 28px; }
-            p { color: #666; margin-bottom: 20px; }
-            .status { 
-                display: inline-block; padding: 8px 20px; border-radius: 25px; 
-                font-size: 14px; font-weight: bold; margin: 15px 0; 
-            }
-            .online { background: #e8f5e9; color: #28a745; }
-            .offline { background: #ffeaea; color: #dc3545; }
-            .links { margin-top: 30px; display: flex; flex-direction: column; gap: 10px; }
-            .links a { 
-                display: block; padding: 12px 24px; background: #25D366; color: white; 
-                text-decoration: none; border-radius: 25px; font-weight: 600;
-                transition: all 0.3s;
-            }
-            .links a:hover { background: #1da851; transform: translateY(-2px); }
-            .links a.health { background: #6c757d; }
-            .links a.health:hover { background: #5a6268; }
-            .footer { margin-top: 30px; font-size: 12px; color: #999; }
-        </style>
-    </head>
-    <body>
-        <div class="container">
-            <div class="icon">🍔</div>
-            <h1>Resto Bot</h1>
-            <p>Restaurant WhatsApp Order Confirmation Service</p>
-            <span class="status ${isConnected ? 'online' : 'offline'}">
-                ${isConnected ? '🟢 Bot Online' : '🔴 Bot Offline'}
-            </span>
-            <div class="links">
-                <a href="/qr">📱 Scan QR Code to Connect</a>
-                <a href="/health" class="health">❤️ Health Check</a>
-            </div>
-            <div class="footer">
-                Render Deployed • v1.0.0
-            </div>
-        </div>
-    </body>
-    </html>
-    `);
-});
+      logger.warn(`[shared] connection closed (${statusCode})`);
+      sharedConnected = false;
+      sharedQr = null;
 
-// ==================== QR CODE PAGE ====================
-app.get('/qr', (req, res) => {
-    if (qrCode && !isConnected) {
-        const html = `
-<!DOCTYPE html>
-<html>
-<head>
-    <title>Scan QR Code - Resto Bot</title>
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <script src="https://cdn.jsdelivr.net/npm/qrcode@1.5.1/build/qrcode.min.js"></script>
-    <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-        body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-            display: flex; justify-content: center; align-items: center;
-            min-height: 100vh; background: #f0f2f5;
-        }
-        .container {
-            background: white; padding: 40px 30px; border-radius: 20px;
-            box-shadow: 0 10px 40px rgba(0,0,0,0.1); text-align: center;
-            max-width: 420px; width: 90%;
-        }
-        h2 { color: #25D366; margin-bottom: 5px; font-size: 24px; }
-        .subtitle { color: #666; margin-bottom: 20px; font-size: 14px; }
-        .status {
-            display: inline-block; padding: 5px 15px; border-radius: 20px;
-            font-size: 13px; font-weight: bold; margin-bottom: 20px;
-        }
-        .disconnected { background: #ffeaea; color: #dc3545; }
-        .connected { background: #e8f5e9; color: #28a745; }
-        #qrcode { 
-            margin: 20px auto; padding: 20px; background: white;
-            border: 3px dashed #25D366; border-radius: 15px; display: inline-block;
-        }
-        #qrcode canvas { display: block; }
-        .scan-text { color: #333; font-weight: 600; margin-top: 15px; font-size: 16px; }
-        .instructions {
-            background: #fff9e6; padding: 15px; border-radius: 12px;
-            margin-top: 25px; text-align: left; font-size: 13px; color: #856404;
-            border-left: 4px solid #ffc107;
-        }
-        .instructions strong { display: block; margin-bottom: 8px; font-size: 14px; }
-        .instructions ol { margin: 0; padding-left: 20px; }
-        .instructions li { margin: 6px 0; }
-        .refresh-btn {
-            background: #25D366; color: white; border: none;
-            padding: 12px 35px; border-radius: 25px; font-size: 16px;
-            cursor: pointer; margin-top: 20px; font-weight: 600;
-            transition: all 0.3s;
-        }
-        .refresh-btn:hover { background: #1da851; transform: translateY(-2px); }
-        .auto-refresh { font-size: 11px; color: #999; margin-top: 12px; }
-        .spinner {
-            display: inline-block; width: 16px; height: 16px; border: 2px solid #25D366;
-            border-top: 2px solid transparent; border-radius: 50%;
-            animation: spin 1s linear infinite; margin-right: 6px; vertical-align: middle;
-        }
-        @keyframes spin { 100% { transform: rotate(360deg); } }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h2>🟢 WhatsApp QR Code</h2>
-        <p class="subtitle">Resto Bot Connection</p>
-        <span class="status disconnected">⏳ Waiting for Scan</span>
-        
-        <div id="qrcode"></div>
-        <p class="scan-text">📱 Scan with WhatsApp</p>
-        
-        <div class="instructions">
-            <strong>📋 How to Connect:</strong>
-            <ol>
-                <li>Open <strong>WhatsApp</strong> on your phone</li>
-                <li>Go to <strong>Settings</strong> ⚙️</li>
-                <li>Tap <strong>Linked Devices</strong></li>
-                <li>Tap <strong>Link a Device</strong></li>
-                <li>Point phone at this QR code</li>
-            </ol>
-        </div>
-        
-        <button class="refresh-btn" onclick="location.reload()">
-            🔄 Refresh QR Code
-        </button>
-        <p class="auto-refresh">
-            <span class="spinner"></span> Auto-refreshes in 30 seconds
-        </p>
-    </div>
-    
-    <script>
-        const qrString = "${qrCode.replace(/"/g, '\\"').replace(/\n/g, '\\n')}";
-        const qrElement = document.getElementById('qrcode');
-        
-        QRCode.toCanvas(qrString, { 
-            width: 250,
-            margin: 2,
-            color: {
-                dark: '#000000',
-                light: '#ffffff'
-            }
-        }, function(error, canvas) {
-            if (error) {
-                console.error(error);
-                qrElement.innerHTML = '<p style="color:red;">Error loading QR code. Please refresh.</p>';
-            } else {
-                qrElement.appendChild(canvas);
-            }
-        });
-        
-        // Auto refresh every 30 seconds
-        setTimeout(() => location.reload(), 30000);
-    </script>
-</body>
-</html>`;
-        
-        res.send(html);
-        
-    } else if (isConnected) {
-        res.send(`
-        <!DOCTYPE html>
-        <html>
-        <head>
-            <title>Bot Connected - Resto Bot</title>
-            <meta name="viewport" content="width=device-width, initial-scale=1">
-            <style>
-                * { margin: 0; padding: 0; box-sizing: border-box; }
-                body {
-                    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-                    display: flex; justify-content: center; align-items: center;
-                    min-height: 100vh; background: #f0f2f5;
-                }
-                .container {
-                    background: white; padding: 50px 40px; border-radius: 20px;
-                    box-shadow: 0 10px 40px rgba(0,0,0,0.1); text-align: center;
-                    max-width: 420px; width: 90%;
-                }
-                .checkmark {
-                    width: 80px; height: 80px; background: #28a745;
-                    border-radius: 50%; display: flex; align-items: center;
-                    justify-content: center; margin: 0 auto 25px;
-                    font-size: 40px; color: white;
-                }
-                h2 { color: #28a745; margin-bottom: 10px; }
-                p { color: #666; margin-bottom: 20px; }
-                .links { margin-top: 25px; }
-                .links a {
-                    display: inline-block; margin: 5px; padding: 10px 25px;
-                    background: #25D366; color: white; text-decoration: none;
-                    border-radius: 25px; font-weight: 600; transition: all 0.3s;
-                }
-                .links a:hover { background: #1da851; }
-                .links a.home { background: #6c757d; }
-                .links a.home:hover { background: #5a6268; }
-            </style>
-        </head>
-        <body>
-            <div class="container">
-                <div class="checkmark">✓</div>
-                <h2>WhatsApp Bot Connected!</h2>
-                <p>Your restaurant bot is online and ready to send order confirmations.</p>
-                <div class="links">
-                    <a href="/">🏠 Home</a>
-                    <a href="/health">❤️ Health Check</a>
-                </div>
-            </div>
-        </body>
-        </html>
-        `);
-    } else {
-        res.json({ 
-            qr: null, 
-            connected: false, 
-            message: 'QR code not yet generated. Bot is initializing. Please refresh in a few seconds.' 
-        });
+      if (statusCode === DisconnectReason.loggedOut) {
+        logger.warn('[shared] logged out — clearing auth folder');
+        if (fs.existsSync(SHARED_AUTH_DIR)) fs.rmSync(SHARED_AUTH_DIR, { recursive: true, force: true });
+      }
+
+      sharedSock = null;
+      setTimeout(startSharedSession, 5000);
+    } else if (connection === 'open') {
+      logger.info('[shared] ✅ WhatsApp connected');
+      sharedConnected = true;
+      sharedQr = null;
+
+      await syncTenantQueues();
     }
-});
+  });
+}
 
-// ==================== HEALTH CHECK ====================
-app.get('/health', (req, res) => {
-    res.json({
-        status: 'running',
-        whatsapp_connected: isConnected,
-        uptime: process.uptime(),
-        timestamp: new Date().toISOString()
+async function syncTenantQueues() {
+  if (!MASTER_KEY) {
+    logger.warn('[shared] no master key — cannot fetch tenants');
+    return;
+  }
+
+  try {
+    const url = `${API_BASE}/node/tenants?mode=${encodeURIComponent(BOT_MODE)}`;
+    const res = await fetch(url, {
+      headers: { 'X-Bot-Master-Key': MASTER_KEY },
     });
-});
+    const json = await res.json();
+    if (!json.ok) throw new Error(json.error || 'Request failed');
 
-// ==================== SEND ORDER CONFIRMATION ====================
-app.post('/send-confirmation', async (req, res) => {
-    try {
-        const orderData = req.body;
-        
-        if (!orderData.phone_number || !orderData.order_number) {
-            return res.status(400).json({ 
-                success: false, 
-                message: 'Missing required fields: phone_number, order_number' 
-            });
-        }
+    const tenants = json.data || [];
+    const wanted = new Set(tenants.map(t => t.tenant_id));
 
-        if (!isConnected) {
-            return res.status(503).json({ 
-                success: false, 
-                message: 'WhatsApp not connected. Please scan QR code first.' 
-            });
-        }
-
-        const message = generateOrderMessage(orderData);
-        const sent = await sendWhatsAppMessage(orderData.phone_number, message);
-
-        if (sent) {
-            logger.info(`Confirmation sent for order #${orderData.order_number}`);
-            res.json({ success: true, message: 'Order confirmation sent successfully' });
-        } else {
-            res.status(500).json({ success: false, message: 'Failed to send WhatsApp message' });
-        }
-    } catch (error) {
-        logger.error('Error sending confirmation:', error);
-        res.status(500).json({ success: false, message: error.message });
+    for (const t of tenants) {
+      if (tenantQueues.has(t.tenant_id)) continue;
+      startQueueForTenant(t);
     }
-});
 
-// ==================== SEND ORDER UPDATE ====================
-app.post('/send-update', async (req, res) => {
-    try {
-        const { phone_number, message } = req.body;
-        
-        if (!phone_number || !message) {
-            return res.status(400).json({ 
-                success: false, 
-                message: 'Missing required fields: phone_number, message' 
-            });
-        }
-
-        if (!isConnected) {
-            return res.status(503).json({ 
-                success: false, 
-                message: 'WhatsApp not connected' 
-            });
-        }
-
-        const sent = await sendWhatsAppMessage(phone_number, message);
-        res.json({ success: sent, message: sent ? 'Update sent' : 'Failed to send' });
-        
-    } catch (error) {
-        res.status(500).json({ success: false, message: error.message });
+    for (const id of [...tenantQueues.keys()]) {
+      if (!wanted.has(id)) {
+        logger.info(`[shared] tenant ${id} no longer served — stopping queue`);
+        const stop = tenantQueues.get(id);
+        if (stop) stop();
+        tenantQueues.delete(id);
+      }
     }
-});
-
-// ==================== HELPER FUNCTIONS ====================
-function formatPhoneNumber(phone) {
-    let cleaned = phone.replace(/\D/g, '');
-    if (cleaned.length === 10) {
-        cleaned = '1' + cleaned;
-    }
-    return cleaned;
+  } catch (err) {
+    logger.error('[shared] tenant sync failed:', err.message);
+  }
 }
 
-function generateOrderMessage(orderData) {
-    const itemsList = orderData.items.map((item, index) => {
-        const name = item.item_name || item.name || 'Item';
-        const qty = item.quantity || 1;
-        const price = parseFloat(item.total_price || (item.unit_price * qty) || 0).toFixed(2);
-        return `${index + 1}. ${name} x${qty} - $${price}`;
-    }).join('\n');
+function startQueueForTenant(tenant) {
+  logger.info(`[shared] queue started for tenant ${tenant.tenant_id}${tenant.name ? ` (${tenant.name})` : ''}${tenant.is_demo ? ' [DEMO]' : ''}`);
 
-    const total = parseFloat(orderData.total_amount || 0).toFixed(2);
-    const payment = (orderData.payment_method || 'cash').toUpperCase();
-    const carNumber = orderData.car_number || 'N/A';
+  const stop = startLaundryQueue(
+    tenant.tenant_id,
+    tenant.api_key,
+    async (phone, message) => {
+      const text = tenant.is_demo
+        ? `[Demo · ${tenant.name}] ${message}`
+        : message;
 
-    return `🛎️ *Order Confirmed!*\n\n` +
-        `━━━━━━━━━━━━━━━━━━━\n` +
-        `📋 *Order #:* ${orderData.order_number}\n` +
-        `━━━━━━━━━━━━━━━━━━━\n\n` +
-        `👤 *Customer:* ${orderData.customer_name}\n` +
-        `🚗 *Car Number:* ${carNumber}\n\n` +
-        `📦 *Order Details:*\n${itemsList}\n\n` +
-        `💰 *Payment:* ${payment}\n` +
-        `💵 *Total:* $${total}\n\n` +
-        `⏱️ *Est. Time:* 15-20 minutes\n\n` +
-        `📍 *Pickup:* Drive-Thru Window\n` +
-        `🚗 We'll look for your car: *${carNumber}*\n\n` +
-        `━━━━━━━━━━━━━━━━━━━\n` +
-        `🙏 *Thank you for your order!*\n` +
-        `Please wait in your car.`;
+      const jid = `${String(phone).replace(/\D/g, '')}@s.whatsapp.net`;
+      await sharedSock.sendMessage(jid, { text });
+    },
+    () => sharedConnected
+  );
+
+  tenantQueues.set(tenant.tenant_id, stop);
 }
 
-async function sendWhatsAppMessage(phoneNumber, message) {
-    try {
-        if (!sock || !isConnected) {
-            throw new Error('WhatsApp not connected');
-        }
+// ============================================================
+// PER-TENANT MODE
+// ============================================================
+function parseTenantList(raw) {
+  if (!raw) return [];
+  return raw.split(',').map(s => s.trim()).filter(Boolean).map(pair => {
+    const [idPart, ...keyParts] = pair.split(':');
+    const id = Number(idPart);
+    const key = keyParts.join(':').trim();
+    return id && key ? { tenant_id: id, api_key: key } : null;
+  }).filter(Boolean);
+}
 
-        const formattedNumber = formatPhoneNumber(phoneNumber);
-        const jid = `${formattedNumber}@s.whatsapp.net`;
+async function startPerTenantSession(tenantId, apiKey) {
+  if (perTenantSessions.has(tenantId)) return;
 
-        await sock.sendMessage(jid, { text: message });
-        logger.info(`Message sent to ${phoneNumber}`);
-        return true;
-    } catch (error) {
-        logger.error(`Failed to send message to ${phoneNumber}:`, error.message);
-        return false;
+  const authDir = path.join(AUTH_ROOT, String(tenantId));
+  ensureDir(authDir);
+
+  const { state, saveCreds } = await useMultiFileAuthState(authDir);
+  const { version } = await fetchLatestBaileysVersion();
+
+  logger.info(`[tenant ${tenantId}] starting dedicated session`);
+
+  const sock = makeWASocket({
+    version, auth: state,
+    logger: pino({ level: 'silent' }),
+    browser: ['Laundry Bot', 'Chrome', '1.0.0'],
+  });
+
+  const session = { sock, connected: false, qr: null, queueStop: null };
+  perTenantSessions.set(tenantId, session);
+
+  sock.ev.on('creds.update', saveCreds);
+
+  sock.ev.on('connection.update', async (update) => {
+    const { connection, lastDisconnect, qr } = update;
+
+    if (qr) {
+      session.qr = qr;
+      logger.info(`[tenant ${tenantId}] QR ready — /qr/${tenantId}`);
     }
-}
 
-// ==================== WHATSAPP CONNECTION ====================
-async function connectToWhatsApp() {
-    try {
-        if (!fs.existsSync(AUTH_FOLDER)) {
-            fs.mkdirSync(AUTH_FOLDER, { recursive: true });
-        }
+    if (connection === 'close') {
+      const code = lastDisconnect?.error instanceof Boom
+        ? lastDisconnect.error.output.statusCode : null;
+      logger.warn(`[tenant ${tenantId}] closed (${code})`);
+      session.connected = false;
+      session.qr = null;
+      if (session.queueStop) { session.queueStop(); session.queueStop = null; }
+      if (code === DisconnectReason.loggedOut && fs.existsSync(authDir)) {
+        fs.rmSync(authDir, { recursive: true, force: true });
+      }
+      perTenantSessions.delete(tenantId);
+      setTimeout(() => startPerTenantSession(tenantId, apiKey), 5000);
+    } else if (connection === 'open') {
+      logger.info(`[tenant ${tenantId}] ✅ connected`);
+      session.connected = true;
+      session.qr = null;
 
-        const { state, saveCreds } = await useMultiFileAuthState(AUTH_FOLDER);
-        const { version } = await fetchLatestBaileysVersion();
-        
-        logger.info(`Starting WhatsApp with version ${version.join('.')}`);
-
-        sock = makeWASocket({
-            version,
-            auth: state,
-            printQRInTerminal: true,
-            logger: pino({ level: 'silent' }),
-            browser: ['Resto Bot', 'Chrome', '1.0.0']
-        });
-
-        sock.ev.on('connection.update', async (update) => {
-            const { connection, lastDisconnect, qr } = update;
-            
-            if (qr) {
-                qrCode = qr;
-                logger.info('New QR Code received');
-            }
-
-            if (connection === 'close') {
-                const statusCode = lastDisconnect?.error instanceof Boom 
-                    ? lastDisconnect.error.output.statusCode 
-                    : null;
-                
-                logger.warn(`Connection closed. Status: ${statusCode}`);
-                isConnected = false;
-                qrCode = null;
-                
-                if (statusCode !== DisconnectReason.loggedOut) {
-                    logger.info('Attempting to reconnect...');
-                    setTimeout(connectToWhatsApp, 5000);
-                } else {
-                    logger.warn('Logged out. Clearing auth folder...');
-                    if (fs.existsSync(AUTH_FOLDER)) {
-                        fs.rmSync(AUTH_FOLDER, { recursive: true, force: true });
-                    }
-                    setTimeout(connectToWhatsApp, 3000);
-                }
-            } else if (connection === 'open') {
-                logger.info('✅ WhatsApp connected successfully!');
-                isConnected = true;
-                qrCode = null;
-                
-                if (!laundryStarted) {
-                    laundryStarted = true;
-                    startLaundryQueue(async (phone, message) => {
-                        const ok = await sendWhatsAppMessage(phone, message);
-                        if (!ok) throw new Error('send failed');
-                    }, () => isConnected);
-                }
-            }
-        });
-
-        sock.ev.on('creds.update', saveCreds);
-
-    } catch (error) {
-        logger.error('Connection error:', error.message);
-        setTimeout(connectToWhatsApp, 10000);
+      if (!session.queueStop) {
+        session.queueStop = startLaundryQueue(
+          tenantId, apiKey,
+          async (phone, message) => {
+            const jid = `${String(phone).replace(/\D/g, '')}@s.whatsapp.net`;
+            await sock.sendMessage(jid, { text: message });
+          },
+          () => session.connected
+        );
+      }
     }
+  });
 }
 
-// ==================== START SERVER ====================
-app.listen(PORT, () => {
-    logger.info(`🚀 Resto Bot server running on port ${PORT}`);
-    logger.info(`📍 Homepage: http://localhost:${PORT}`);
-    logger.info(`📱 QR Code: http://localhost:${PORT}/qr`);
-    logger.info(`❤️ Health: http://localhost:${PORT}/health`);
-    
-    connectToWhatsApp();
+function isPerTenantMode() {
+  return BOT_MODE === 'per_tenant' && !!(process.env.LM_TENANTS || '').trim();
+}
+
+// ============================================================
+// HTTP SERVER
+// ============================================================
+const app = express();
+
+// Shared CSS for all pages
+const pageCss = `
+  *{box-sizing:border-box}
+  body{margin:0;font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Inter,Roboto,sans-serif;background:#f8fafc;color:#0f172a;-webkit-font-smoothing:antialiased}
+  .wrap{max-width:720px;margin:2rem auto;padding:0 1rem}
+  .card{background:#fff;border:1px solid #e2e8f0;border-radius:16px;padding:2rem;box-shadow:0 4px 12px rgba(15,23,42,.06)}
+  .brand{display:flex;align-items:center;gap:.6rem;font-weight:800;font-size:1.2rem;color:#1b2b4b;margin-bottom:1rem}
+  .brand .ic{width:40px;height:40px;border-radius:11px;background:linear-gradient(135deg,#0f766e,#115e59);display:flex;align-items:center;justify-content:center;font-size:1.3rem}
+  h1{margin:0 0 .4rem;font-size:1.4rem;color:#1b2b4b}
+  .sub{color:#475569;margin-bottom:1.5rem;font-size:.95rem}
+  .stat{display:flex;justify-content:space-between;align-items:center;padding:.7rem 0;border-bottom:1px solid #e2e8f0}
+  .stat:last-child{border-bottom:0}
+  .stat .lbl{color:#94a3b8;font-size:.85rem;font-weight:600;text-transform:uppercase;letter-spacing:.03em}
+  .stat .val{font-weight:700;color:#1b2b4b}
+  .badge{display:inline-block;padding:.2rem .7rem;border-radius:99px;font-size:.78rem;font-weight:700}
+  .badge.ok{background:#dcfce7;color:#166534}
+  .badge.off{background:#fee2e2;color:#991b1b}
+  .badge.warn{background:#fef3c7;color:#92400e}
+  .btn{display:inline-flex;align-items:center;justify-content:center;gap:.4rem;padding:.7rem 1.2rem;background:#0f766e;color:#fff;text-decoration:none;border-radius:10px;font-weight:700;font-size:.95rem;border:0;cursor:pointer;transition:background .15s}
+  .btn:hover{background:#115e59}
+  .btn.alt{background:#fff;color:#0f766e;border:1px solid #cbd5e1}
+  .btn.alt:hover{background:#f0fdfa}
+  .qr-wrap{margin:1.5rem auto;padding:1.2rem;background:#fff;border:3px dashed #0f766e;border-radius:14px;display:inline-block}
+  .qr-wrap canvas{display:block}
+  .instructions{background:#fff9e6;padding:1rem 1.2rem;border-radius:10px;margin-top:1.2rem;text-align:left;font-size:.88rem;color:#856404;border-left:4px solid #ffc107}
+  .instructions strong{display:block;margin-bottom:.4rem;font-size:.92rem}
+  .instructions ol{margin:0;padding-left:1.2rem}
+  .instructions li{margin:.3rem 0}
+  .check{width:80px;height:80px;border-radius:99px;background:#16a34a;color:#fff;display:flex;align-items:center;justify-content:center;font-size:3rem;margin:0 auto 1rem}
+  table{width:100%;border-collapse:collapse;font-size:.9rem;margin-top:1rem}
+  th{background:#f1f5f9;font-size:.72rem;text-transform:uppercase;letter-spacing:.04em;color:#475569;text-align:left;padding:.5rem .7rem;font-weight:700}
+  td{padding:.6rem .7rem;border-bottom:1px solid #e2e8f0}
+  td:last-child,th:last-child{text-align:right}
+  .center{text-align:center}
+  .mt{margin-top:1rem}
+`;
+
+// Homepage
+app.get('/', (req, res) => {
+  if (isPerTenantMode()) {
+    const list = [...perTenantSessions.entries()].map(([id, s]) => ({ id, connected: s.connected }));
+    const allOk = list.length && list.every(l => l.connected);
+    res.send(`<!doctype html><html><head><meta charset="utf-8"><title>Laundry Bot</title>
+      <meta name="viewport" content="width=device-width,initial-scale=1">
+      <style>${pageCss}</style></head><body>
+      <div class="wrap"><div class="card">
+        <div class="brand"><span class="ic">🧺</span> Laundry Bot · Per-tenant</div>
+        <h1>Status</h1>
+        <div class="sub">Serving ${list.length} tenant${list.length === 1 ? '' : 's'}</div>
+        <div class="stat"><span class="lbl">Overall</span><span class="badge ${allOk ? 'ok' : 'off'}">${allOk ? 'All connected' : 'Some offline'}</span></div>
+        ${list.length ? `<table>
+          <thead><tr><th>Tenant</th><th>Status</th><th>Action</th></tr></thead>
+          <tbody>${list.map(l => `<tr>
+            <td><b>#${l.id}</b></td>
+            <td><span class="badge ${l.connected ? 'ok' : 'off'}">${l.connected ? 'Connected' : 'Offline'}</span></td>
+            <td>${l.connected ? '—' : `<a class="btn alt" href="/qr/${l.id}">Scan QR</a>`}</td>
+          </tr>`).join('')}</tbody>
+        </table>` : '<p class="mt" style="color:#94a3b8">No tenants configured.</p>'}
+      </div></div></body></html>`);
+    return;
+  }
+
+  const connected = sharedConnected;
+  const count = tenantQueues.size;
+  res.send(`<!doctype html><html><head><meta charset="utf-8"><title>Laundry Bot</title>
+    <meta name="viewport" content="width=device-width,initial-scale=1">
+    <style>${pageCss}</style></head><body>
+    <div class="wrap"><div class="card">
+      <div class="brand"><span class="ic">🧺</span> Laundry Bot</div>
+      <h1>Shared mode</h1>
+      <div class="sub">One WhatsApp session serving all tenants</div>
+      <div class="stat"><span class="lbl">WhatsApp</span><span class="badge ${connected ? 'ok' : 'off'}">${connected ? 'Connected' : 'Offline'}</span></div>
+      <div class="stat"><span class="lbl">Tenants served</span><span class="val">${count}</span></div>
+      <div class="stat"><span class="lbl">Uptime</span><span class="val">${Math.floor(process.uptime() / 60)} min</span></div>
+      ${!connected ? `<div class="center mt"><a class="btn" href="/qr">📱 Scan QR to connect</a></div>` : `<div class="center mt"><span class="badge ok">✓ Running normally</span></div>`}
+    </div></div></body></html>`);
 });
 
-// Graceful shutdown
+// Health — stays JSON for the PHP endpoint. Add ?format=html for a pretty page.
+app.get('/health', (req, res) => {
+  const data = isPerTenantMode()
+    ? {
+        status: 'running',
+        mode: 'per_tenant',
+        whatsapp_connected: [...perTenantSessions.values()].some(s => s.connected),
+        tenants_total: perTenantSessions.size,
+        tenants_connected: [...perTenantSessions.values()].filter(s => s.connected).length,
+        uptime: process.uptime(),
+        timestamp: new Date().toISOString(),
+      }
+    : {
+        status: 'running',
+        mode: 'shared',
+        whatsapp_connected: sharedConnected,
+        tenants_served: tenantQueues.size,
+        uptime: process.uptime(),
+        timestamp: new Date().toISOString(),
+      };
+
+  if (req.query.format === 'html') {
+    const ok = data.whatsapp_connected;
+    return res.send(`<!doctype html><html><head><meta charset="utf-8"><title>Bot Health</title>
+      <meta name="viewport" content="width=device-width,initial-scale=1">
+      <style>${pageCss}</style></head><body>
+      <div class="wrap"><div class="card">
+        <div class="brand"><span class="ic">🧺</span> Laundry Bot · Health</div>
+        <div class="stat"><span class="lbl">Status</span><span class="badge ${ok ? 'ok' : 'off'}">${ok ? 'Healthy' : 'Degraded'}</span></div>
+        <div class="stat"><span class="lbl">Mode</span><span class="val">${data.mode}</span></div>
+        <div class="stat"><span class="lbl">WhatsApp</span><span class="val">${ok ? 'Connected' : 'Offline'}</span></div>
+        ${data.mode === 'shared'
+          ? `<div class="stat"><span class="lbl">Tenants served</span><span class="val">${data.tenants_served}</span></div>`
+          : `<div class="stat"><span class="lbl">Tenants connected</span><span class="val">${data.tenants_connected} / ${data.tenants_total}</span></div>`}
+        <div class="stat"><span class="lbl">Uptime</span><span class="val">${Math.floor(data.uptime / 60)} min</span></div>
+        <div class="stat"><span class="lbl">Checked at</span><span class="val">${data.timestamp.replace('T', ' ').slice(0, 19)}</span></div>
+        <div class="center mt">
+          <a class="btn alt" href="/">← Home</a>
+          <a class="btn" href="/health?format=html">↻ Refresh</a>
+        </div>
+      </div></div></body></html>`);
+  }
+  res.json(data);
+});
+
+// Status JSON
+app.get('/status', (req, res) => {
+  res.json({
+    ok: true,
+    mode: isPerTenantMode() ? 'per_tenant' : 'shared',
+    tenants: isPerTenantMode()
+      ? [...perTenantSessions.entries()].map(([id, s]) => ({
+          tenant_id: id, connected: s.connected, has_qr: !!s.qr,
+        }))
+      : [...tenantQueues.keys()].map(id => ({ tenant_id: id, connected: sharedConnected })),
+  });
+});
+
+// QR — shared
+app.get('/qr', (req, res) => {
+  if (isPerTenantMode()) {
+    const offline = [...perTenantSessions.entries()].find(([_, s]) => !s.connected);
+    if (offline) return res.redirect('/qr/' + offline[0]);
+    return res.send(`<!doctype html><html><head><meta charset="utf-8"><title>Connected</title>
+      <meta name="viewport" content="width=device-width,initial-scale=1"><style>${pageCss}</style></head><body>
+      <div class="wrap"><div class="card center">
+        <div class="check">✓</div><h1>All connected</h1>
+        <p class="sub">Every tenant is linked.</p>
+        <a class="btn" href="/">← Home</a>
+      </div></div></body></html>`);
+  }
+
+  if (sharedConnected) {
+    return res.send(`<!doctype html><html><head><meta charset="utf-8"><title>Connected</title>
+      <meta name="viewport" content="width=device-width,initial-scale=1"><style>${pageCss}</style></head><body>
+      <div class="wrap"><div class="card center">
+        <div class="check">✓</div><h1>Connected</h1>
+        <p class="sub">WhatsApp is linked. Serving ${tenantQueues.size} tenant${tenantQueues.size === 1 ? '' : 's'}.</p>
+        <a class="btn" href="/">← Home</a>
+      </div></div></body></html>`);
+  }
+
+  if (!sharedQr) {
+    return res.send(`<!doctype html><html><head><meta charset="utf-8"><title>QR pending</title>
+      <meta name="viewport" content="width=device-width,initial-scale=1"><style>${pageCss}</style></head><body>
+      <div class="wrap"><div class="card center">
+        <h1>QR not ready yet</h1>
+        <p class="sub">WhatsApp is starting up. This page will refresh automatically.</p>
+        <script>setTimeout(()=>location.reload(),3000)</script>
+      </div></div></body></html>`);
+  }
+
+  res.send(`<!doctype html><html><head><meta charset="utf-8"><title>Scan QR</title>
+    <meta name="viewport" content="width=device-width,initial-scale=1">
+    <script src="https://cdn.jsdelivr.net/npm/qrcode@1.5.1/build/qrcode.min.js"></script>
+    <style>${pageCss}</style></head><body>
+    <div class="wrap"><div class="card center">
+      <div class="brand"><span class="ic">🧺</span> Laundry Bot</div>
+      <h1>Scan QR code</h1>
+      <p class="sub">Link your WhatsApp to serve all tenants</p>
+      <div class="qr-wrap"><div id="qrcode"></div></div>
+      <div class="instructions">
+        <strong>How to connect:</strong>
+        <ol>
+          <li>Open <b>WhatsApp</b> on the phone</li>
+          <li>Tap <b>Settings</b> → <b>Linked Devices</b></li>
+          <li>Tap <b>Link a Device</b></li>
+          <li>Point the phone at this QR code</li>
+        </ol>
+      </div>
+      <p style="color:#94a3b8;font-size:.8rem;margin-top:1rem">Auto-refreshes every 30 seconds</p>
+    </div></div>
+    <script>
+      QRCode.toCanvas(${JSON.stringify(sharedQr)}, { width: 260, margin: 2 }, function(err, canvas) {
+        if (err) { document.getElementById('qrcode').innerHTML = '<p>Error loading QR</p>'; return; }
+        document.getElementById('qrcode').appendChild(canvas);
+      });
+      setTimeout(() => location.reload(), 30000);
+    </script>
+    </body></html>`);
+});
+
+// QR — per tenant
+app.get('/qr/:tenantId', (req, res) => {
+  const id = Number(req.params.tenantId);
+  const s = perTenantSessions.get(id);
+
+  if (!s) return res.status(404).send(`<!doctype html><html><head><meta charset="utf-8"><style>${pageCss}</style></head><body>
+    <div class="wrap"><div class="card center">
+      <h1>Tenant ${id} not served</h1>
+      <a class="btn" href="/">← Home</a>
+    </div></div></body></html>`);
+
+  if (s.connected) {
+    return res.send(`<!doctype html><html><head><meta charset="utf-8"><style>${pageCss}</style></head><body>
+      <div class="wrap"><div class="card center">
+        <div class="check">✓</div><h1>Connected</h1>
+        <p class="sub">Tenant ${id} is linked.</p>
+        <a class="btn" href="/">← Home</a>
+      </div></div></body></html>`);
+  }
+
+  if (!s.qr) {
+    return res.send(`<!doctype html><html><head><meta charset="utf-8"><style>${pageCss}</style></head><body>
+      <div class="wrap"><div class="card center">
+        <h1>QR not ready</h1>
+        <script>setTimeout(()=>location.reload(),3000)</script>
+      </div></div></body></html>`);
+  }
+
+  res.send(`<!doctype html><html><head><meta charset="utf-8"><title>Scan QR · tenant ${id}</title>
+    <meta name="viewport" content="width=device-width,initial-scale=1">
+    <script src="https://cdn.jsdelivr.net/npm/qrcode@1.5.1/build/qrcode.min.js"></script>
+    <style>${pageCss}</style></head><body>
+    <div class="wrap"><div class="card center">
+      <div class="brand"><span class="ic">🧺</span> Laundry Bot</div>
+      <h1>Scan QR code</h1>
+      <p class="sub">Tenant #${id}</p>
+      <div class="qr-wrap"><div id="qrcode"></div></div>
+      <div class="instructions">
+        <strong>How to connect:</strong>
+        <ol>
+          <li>Open <b>WhatsApp</b> on the shop phone</li>
+          <li>Tap <b>Settings</b> → <b>Linked Devices</b></li>
+          <li>Tap <b>Link a Device</b></li>
+          <li>Point the phone at this QR code</li>
+        </ol>
+      </div>
+      <p style="color:#94a3b8;font-size:.8rem;margin-top:1rem">Auto-refreshes every 30 seconds</p>
+    </div></div>
+    <script>
+      QRCode.toCanvas(${JSON.stringify(s.qr)}, { width: 260, margin: 2 }, function(err, canvas) {
+        if (!err) document.getElementById('qrcode').appendChild(canvas);
+      });
+      setTimeout(() => location.reload(), 30000);
+    </script>
+    </body></html>`);
+});
+
+// ============================================================
+// STARTUP
+// ============================================================
+app.listen(PORT, async () => {
+  logger.info(`🚀 Bot server on port ${PORT}`);
+
+  if (isPerTenantMode()) {
+    const list = parseTenantList(process.env.LM_TENANTS);
+    logger.info(`Mode: PER-TENANT (${list.length} tenants from LM_TENANTS)`);
+    for (const t of list) {
+      startPerTenantSession(t.tenant_id, t.api_key).catch(err => {
+        logger.error(`Failed to start tenant ${t.tenant_id}:`, err.message);
+      });
+    }
+  } else if (MASTER_KEY) {
+    logger.info(`Mode: SHARED (one WhatsApp session serving all tenants)`);
+    await startSharedSession();
+    setInterval(syncTenantQueues, 5 * 60 * 1000);
+  } else {
+    logger.error('Neither LM_TENANTS nor LM_BOT_MASTER_KEY set — nothing to do');
+  }
+});
+
 process.on('SIGINT', async () => {
-    logger.info('Shutting down...');
-    if (sock) {
-        await sock.logout();
-    }
-    process.exit(0);
+  logger.info('Shutting down…');
+  for (const stop of tenantQueues.values()) stop();
+  for (const s of perTenantSessions.values()) {
+    if (s.queueStop) s.queueStop();
+    try { await s.sock.logout(); } catch {}
+  }
+  try { if (sharedSock) await sharedSock.logout(); } catch {}
+  process.exit(0);
 });
