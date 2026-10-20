@@ -1,6 +1,5 @@
 // bot.js — multi-tenant WhatsApp bot for Laundry Man
-// Baileys 7.x + LID fallback via order number + original restaurant formatting
-// FINAL VERSION — all fixes applied
+// Baileys 7.x with correct CommonJS imports + LID debug + restaurant endpoints preserved
 
 const express = require('express');
 const { Boom } = require('@hapi/boom');
@@ -10,11 +9,10 @@ const path = require('path');
 require('dotenv').config();
 
 // ============================================================
-// Baileys 7.x — ESM-only. Correct CommonJS import:
-//   - makeWASocket     → on .default
-//   - useMultiFileAuthState → named export on module
-//   - DisconnectReason → named export on module
-//   - fetchLatestBaileysVersion → named export on module
+// Baileys 7.x is ESM-only. In CommonJS:
+//   - makeWASocket lives on .default
+//   - useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion
+//     are NAMED exports on the module itself (NOT on .default)
 // ============================================================
 const baileysModule = require('@whiskeysockets/baileys');
 const baileys = baileysModule.default;
@@ -37,7 +35,7 @@ const BOT_MODE = (process.env.LM_BOT_MODE || 'shared').trim();
 const AUTH_ROOT = './auth_sessions';
 const SHARED_AUTH_DIR = path.join(AUTH_ROOT, 'shared');
 
-// Render provides this automatically in production
+// Render injects RENDER_EXTERNAL_URL at runtime
 const PUBLIC_URL = process.env.RENDER_EXTERNAL_URL
   || process.env.PUBLIC_URL
   || `http://localhost:${PORT}`;
@@ -111,6 +109,12 @@ async function resolvePhone(msg, sock) {
     } catch {}
   }
 
+  if (msg.key && msg.key.participant) {
+    const part = String(msg.key.participant);
+    const cleaned = part.split('@')[0].split(':')[0];
+    if (cleaned && cleaned.length >= 8) return cleaned;
+  }
+
   return '';
 }
 
@@ -118,7 +122,6 @@ function extractText(msg) {
   const m = msg.message;
   if (!m) return '';
   let text = '';
-
   if (m.conversation) text = m.conversation;
   if (!text && m.extendedTextMessage) text = m.extendedTextMessage.text || '';
   if (!text && m.imageMessage) text = m.imageMessage.caption || '';
@@ -147,7 +150,6 @@ function extractText(msg) {
     if (inner.conversation) text = inner.conversation;
     if (inner.extendedTextMessage) text = inner.extendedTextMessage.text || '';
   }
-
   return String(text || '').trim();
 }
 
@@ -450,63 +452,15 @@ app.get('/', (req, res) => {
     : sharedConnected;
   const tenantsServed = isPerTenantMode() ? perTenantSessions.size : tenantQueues.size;
 
-  res.send(`
-  <!DOCTYPE html>
-  <html>
-  <head>
-    <title>Laundry Man Bot — WhatsApp Service</title>
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <style>
-      * { margin: 0; padding: 0; box-sizing: border-box; }
-      body {
-        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-        display: flex; justify-content: center; align-items: center;
-        min-height: 100vh; background: linear-gradient(135deg, #0f766e 0%, #115e59 100%);
-        padding: 1rem;
-      }
-      .container {
-        background: white; padding: 50px 40px; border-radius: 20px;
-        box-shadow: 0 20px 60px rgba(0,0,0,0.3); text-align: center;
-        max-width: 460px; width: 100%;
-      }
-      .icon { font-size: 64px; margin-bottom: 20px; }
-      h1 { color: #1b2b4b; margin-bottom: 10px; font-size: 28px; }
-      p { color: #666; margin-bottom: 20px; }
-      .status {
-        display: inline-block; padding: 8px 20px; border-radius: 25px;
-        font-size: 14px; font-weight: bold; margin: 15px 0;
-      }
-      .online { background: #e8f5e9; color: #28a745; }
-      .offline { background: #ffeaea; color: #dc3545; }
-      .info-line { font-size: 13px; color: #999; margin-top: .4rem; }
-      .links { margin-top: 30px; display: flex; flex-direction: column; gap: 10px; }
-      .links a {
-        display: block; padding: 12px 24px; background: #25D366; color: white;
-        text-decoration: none; border-radius: 25px; font-weight: 600;
-      }
-      .links a.health { background: #6c757d; }
-      .footer { margin-top: 30px; font-size: 12px; color: #999; }
-    </style>
-  </head>
-  <body>
-    <div class="container">
-      <div class="icon">🧺</div>
-      <h1>Laundry Man Bot</h1>
-      <p>${isPerTenantMode() ? 'Dedicated WhatsApp Service' : 'Multi-tenant WhatsApp Service'}</p>
-      <span class="status ${connected ? 'online' : 'offline'}">
-        ${connected ? '🟢 Bot Online' : '🔴 Bot Offline'}
-      </span>
-      <div class="info-line">
-        ${isPerTenantMode() ? 'Per-tenant mode' : 'Shared mode'} · Serving ${tenantsServed} tenant${tenantsServed === 1 ? '' : 's'}
-      </div>
-      <div class="links">
-        <a href="/qr">📱 ${connected ? 'View Connection' : 'Scan QR Code to Connect'}</a>
-        <a href="/health" class="health">❤️ Health Check</a>
-      </div>
-      <div class="footer">Render Deployed • v2.0</div>
-    </div>
-  </body>
-  </html>`);
+  res.send(`<!DOCTYPE html>
+<html><head><title>Laundry Man Bot</title><meta name="viewport" content="width=device-width,initial-scale=1">
+<style>*{margin:0;padding:0;box-sizing:border-box}body{font-family:-apple-system,sans-serif;display:flex;justify-content:center;align-items:center;min-height:100vh;background:linear-gradient(135deg,#0f766e 0%,#115e59 100%);padding:1rem}.c{background:#fff;padding:50px 40px;border-radius:20px;box-shadow:0 20px 60px rgba(0,0,0,.3);text-align:center;max-width:460px;width:100%}.icon{font-size:64px;margin-bottom:20px}h1{color:#1b2b4b;margin-bottom:10px;font-size:28px}p{color:#666;margin-bottom:20px}.status{display:inline-block;padding:8px 20px;border-radius:25px;font-size:14px;font-weight:bold;margin:15px 0}.online{background:#e8f5e9;color:#28a745}.offline{background:#ffeaea;color:#dc3545}.links{margin-top:30px;display:flex;flex-direction:column;gap:10px}.links a{display:block;padding:12px 24px;background:#25D366;color:#fff;text-decoration:none;border-radius:25px;font-weight:600}.links a.health{background:#6c757d}</style></head>
+<body><div class="c"><div class="icon">🧺</div><h1>Laundry Man Bot</h1>
+<p>${isPerTenantMode() ? 'Dedicated' : 'Multi-tenant'} WhatsApp Service</p>
+<span class="status ${connected ? 'online' : 'offline'}">${connected ? '🟢 Bot Online' : '🔴 Bot Offline'}</span>
+<div style="font-size:13px;color:#999;margin-top:.4rem">Serving ${tenantsServed} tenant${tenantsServed === 1 ? '' : 's'}</div>
+<div class="links"><a href="/qr">📱 ${connected ? 'View Connection' : 'Scan QR'}</a><a href="/health" class="health">❤️ Health</a></div>
+</div></body></html>`);
 });
 
 // ==================== QR PAGE ====================
@@ -521,22 +475,20 @@ app.get('/qr', (req, res) => {
     : sharedConnected;
 
   if (qrCode && !isConnected) {
-    return res.send(`
-<!DOCTYPE html><html><head><title>Scan QR Code — Laundry Man Bot</title>
-<meta name="viewport" content="width=device-width, initial-scale=1">
+    return res.send(`<!DOCTYPE html><html><head><title>Scan QR</title><meta name="viewport" content="width=device-width,initial-scale=1">
 <script src="https://cdn.jsdelivr.net/npm/qrcode@1.5.1/build/qrcode.min.js"></script>
-<style>*{margin:0;padding:0;box-sizing:border-box}body{font-family:-apple-system,sans-serif;display:flex;justify-content:center;align-items:center;min-height:100vh;background:#f0f2f5;padding:1rem}.c{background:#fff;padding:40px 30px;border-radius:20px;box-shadow:0 10px 40px rgba(0,0,0,.1);text-align:center;max-width:420px;width:100%}h2{color:#0f766e;margin-bottom:5px;font-size:24px}.sub{color:#666;margin-bottom:20px;font-size:14px}.st{display:inline-block;padding:5px 15px;border-radius:20px;font-size:13px;font-weight:bold;margin-bottom:20px;background:#ffeaea;color:#dc3545}#qrcode{margin:20px auto;padding:20px;background:#fff;border:3px dashed #0f766e;border-radius:15px;display:inline-block}.scan{color:#333;font-weight:600;margin-top:15px;font-size:16px}.ins{background:#fff9e6;padding:15px;border-radius:12px;margin-top:25px;text-align:left;font-size:13px;color:#856404;border-left:4px solid #ffc107}.ins strong{display:block;margin-bottom:8px;font-size:14px}.ins ol{margin:0;padding-left:20px}.ins li{margin:6px 0}.ref{background:#0f766e;color:#fff;border:none;padding:12px 35px;border-radius:25px;font-size:16px;cursor:pointer;margin-top:20px;font-weight:600}.auto{font-size:11px;color:#999;margin-top:12px}</style></head>
-<body><div class="c"><h2>🧺 WhatsApp QR Code</h2><p class="sub">Laundry Man Bot Connection</p>
+<style>*{margin:0;padding:0;box-sizing:border-box}body{font-family:-apple-system,sans-serif;display:flex;justify-content:center;align-items:center;min-height:100vh;background:#f0f2f5;padding:1rem}.c{background:#fff;padding:40px 30px;border-radius:20px;box-shadow:0 10px 40px rgba(0,0,0,.1);text-align:center;max-width:420px;width:100%}h2{color:#0f766e;margin-bottom:5px;font-size:24px}.sub{color:#666;margin-bottom:20px;font-size:14px}.st{display:inline-block;padding:5px 15px;border-radius:20px;font-size:13px;font-weight:bold;margin-bottom:20px;background:#ffeaea;color:#dc3545}#qrcode{margin:20px auto;padding:20px;background:#fff;border:3px dashed #0f766e;border-radius:15px;display:inline-block}.scan{color:#333;font-weight:600;margin-top:15px;font-size:16px}.ins{background:#fff9e6;padding:15px;border-radius:12px;margin-top:25px;text-align:left;font-size:13px;color:#856404;border-left:4px solid #ffc107}.ins strong{display:block;margin-bottom:8px;font-size:14px}.ins ol{margin:0;padding-left:20px}.ref{background:#0f766e;color:#fff;border:none;padding:12px 35px;border-radius:25px;font-size:16px;cursor:pointer;margin-top:20px;font-weight:600}</style></head>
+<body><div class="c"><h2>🧺 WhatsApp QR Code</h2><p class="sub">Laundry Man Bot</p>
 <span class="st">⏳ Waiting for Scan</span><div id="qrcode"></div>
 <p class="scan">📱 Scan with WhatsApp</p>
 <div class="ins"><strong>📋 How to Connect:</strong><ol>
 <li>Open <strong>WhatsApp</strong> on your phone</li>
-<li>Go to <strong>Settings</strong> ⚙️</li>
+<li>Go to <strong>Settings</strong></li>
 <li>Tap <strong>Linked Devices</strong></li>
 <li>Tap <strong>Link a Device</strong></li>
 <li>Point phone at this QR code</li></ol></div>
 <button class="ref" onclick="location.reload()">🔄 Refresh QR Code</button>
-<p class="auto">Auto-refreshes in 30 seconds</p></div>
+</div>
 <script>
 const qrString = ${JSON.stringify(qrCode)};
 QRCode.toCanvas(qrString, { width: 250, margin: 2 }, function(error, canvas) {
@@ -548,9 +500,7 @@ setTimeout(() => location.reload(), 30000);
 
   if (isConnected) {
     const count = isPerTenantMode() ? perTenantSessions.size : tenantQueues.size;
-    return res.send(`
-<!DOCTYPE html><html><head><title>Connected</title>
-<meta name="viewport" content="width=device-width, initial-scale=1">
+    return res.send(`<!DOCTYPE html><html><head><title>Connected</title><meta name="viewport" content="width=device-width,initial-scale=1">
 <style>*{margin:0;padding:0;box-sizing:border-box}body{font-family:-apple-system,sans-serif;display:flex;justify-content:center;align-items:center;min-height:100vh;background:#f0f2f5;padding:1rem}.c{background:#fff;padding:50px 40px;border-radius:20px;box-shadow:0 10px 40px rgba(0,0,0,.1);text-align:center;max-width:420px;width:100%}.chk{width:80px;height:80px;background:#28a745;border-radius:50%;display:flex;align-items:center;justify-content:center;margin:0 auto 25px;font-size:40px;color:#fff}h2{color:#28a745;margin-bottom:10px}p{color:#666;margin-bottom:20px}.links a{display:inline-block;margin:5px;padding:10px 25px;background:#25D366;color:#fff;text-decoration:none;border-radius:25px;font-weight:600}.links a.home{background:#6c757d}</style></head>
 <body><div class="c"><div class="chk">✓</div><h2>WhatsApp Bot Connected!</h2>
 <p>Serving ${count} tenant${count === 1 ? '' : 's'}.</p>
@@ -567,18 +517,16 @@ app.get('/qr/:tenantId', (req, res) => {
   if (!s) return res.send(`<!doctype html><html><body style="font-family:sans-serif;text-align:center;padding:3rem"><h2>Tenant ${id} not served</h2><a href="/">Home</a></body></html>`);
   if (s.connected) return res.send(`<!doctype html><html><body style="font-family:sans-serif;text-align:center;padding:3rem;background:#f0f2f5"><div style="background:#fff;padding:3rem;border-radius:20px;display:inline-block"><div style="font-size:3rem;color:#28a745">✓</div><h2 style="color:#28a745">Connected</h2><p>Tenant #${id}</p><a href="/">← Home</a></div></body></html>`);
   if (!s.qr) return res.send(`<!doctype html><html><body style="font-family:sans-serif;text-align:center;padding:3rem"><h2>QR not ready</h2><p>Refreshing…</p><script>setTimeout(()=>location.reload(),3000)</script></body></html>`);
-  res.send(`<!doctype html><html><head><meta charset="utf-8"><title>Scan QR · tenant ${id}</title>
-<meta name="viewport" content="width=device-width,initial-scale=1">
+  res.send(`<!doctype html><html><head><meta charset="utf-8"><title>Scan QR · tenant ${id}</title><meta name="viewport" content="width=device-width,initial-scale=1">
 <script src="https://cdn.jsdelivr.net/npm/qrcode@1.5.1/build/qrcode.min.js"></script>
 <style>body{font-family:sans-serif;background:#f0f2f5;display:flex;justify-content:center;align-items:center;min-height:100vh;margin:0;padding:1rem}.c{background:#fff;padding:2rem;border-radius:20px;text-align:center;box-shadow:0 10px 40px rgba(0,0,0,.1)}h2{color:#0f766e}#qrcode{margin:1rem auto;padding:1rem;border:3px dashed #0f766e;border-radius:15px;display:inline-block}</style></head>
 <body><div class="c"><h2>Scan QR · Tenant ${id}</h2><div id="qrcode"></div>
-<p style="color:#94a3b8;font-size:.8rem;margin-top:1rem">Auto-refreshes every 30 seconds</p></div>
 <script>
 QRCode.toCanvas(${JSON.stringify(s.qr)}, { width: 250, margin: 2 }, function(err, canvas) {
   if (!err) document.getElementById('qrcode').appendChild(canvas);
 });
 setTimeout(() => location.reload(), 30000);
-</script></body></html>`);
+</script></div></body></html>`);
 });
 
 // ==================== HEALTH ====================
@@ -607,8 +555,7 @@ app.get('/health', (req, res) => {
   const connected = data.whatsapp_connected;
   const uptimeStr = `${Math.floor(data.uptime / 60)} min`;
 
-  res.send(`<!DOCTYPE html><html><head><title>Health — Laundry Man Bot</title>
-<meta name="viewport" content="width=device-width, initial-scale=1">
+  res.send(`<!DOCTYPE html><html><head><title>Health</title><meta name="viewport" content="width=device-width,initial-scale=1">
 <style>*{margin:0;padding:0;box-sizing:border-box}body{font-family:-apple-system,sans-serif;display:flex;justify-content:center;align-items:center;min-height:100vh;background:linear-gradient(135deg,#0f766e 0%,#115e59 100%);padding:1rem}.c{background:#fff;padding:50px 40px;border-radius:20px;box-shadow:0 20px 60px rgba(0,0,0,.3);text-align:center;max-width:460px;width:100%}h1{color:#1b2b4b;margin-bottom:10px;font-size:26px}.st{display:inline-block;padding:10px 24px;border-radius:25px;font-size:15px;font-weight:bold;margin:15px 0 25px}.on{background:#e8f5e9;color:#28a745}.off{background:#ffeaea;color:#dc3545}.stats{display:grid;gap:.5rem;margin-bottom:25px;text-align:left}.row{display:flex;justify-content:space-between;padding:.6rem .9rem;background:#f8fafc;border-radius:10px;font-size:14px}.row .l{color:#94a3b8;font-weight:600;text-transform:uppercase;font-size:12px}.row .v{color:#1b2b4b;font-weight:700;font-family:monospace;font-size:13px}.links a{display:block;padding:12px 24px;background:#0f766e;color:#fff;text-decoration:none;border-radius:25px;font-weight:600;margin-bottom:8px}.links a.home{background:#6c757d}</style></head>
 <body><div class="c"><div style="font-size:64px;margin-bottom:20px">${connected ? '✅' : '⚠️'}</div>
 <h1>Bot Health</h1>
@@ -621,9 +568,8 @@ ${data.mode === 'shared'
   ? `<div class="row"><span class="l">Tenants served</span><span class="v">${data.tenants_served}</span></div>`
   : `<div class="row"><span class="l">Tenants connected</span><span class="v">${data.tenants_connected}/${data.tenants_total}</span></div>`}
 <div class="row"><span class="l">Uptime</span><span class="v">${uptimeStr}</span></div>
-<div class="row"><span class="l">Checked at</span><span class="v">${data.timestamp.slice(11,19)} UTC</span></div>
 </div>
-<div class="links">${!connected ? '<a href="/qr">📱 Scan QR</a>' : ''}<a href="/" class="home">🏠 Home</a></div>
+<div class="links"><a href="/" class="home">🏠 Home</a></div>
 </div></body></html>`);
 });
 
@@ -696,7 +642,6 @@ app.post('/send-confirmation', async (req, res) => {
     }
     res.status(500).json({ success: false, message: 'Failed to send' });
   } catch (error) {
-    logger.error('Error sending confirmation:', error);
     res.status(500).json({ success: false, message: error.message });
   }
 });
@@ -706,7 +651,7 @@ app.post('/send-update', async (req, res) => {
     const { phone_number, message } = req.body;
     if (!phone_number || !message) return res.status(400).json({ success: false, message: 'Missing fields' });
     const sent = await sendWhatsAppMessage(phone_number, message);
-    res.json({ success: sent, message: sent ? 'Update sent' : 'Failed' });
+    res.json({ success: sent });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
   }
