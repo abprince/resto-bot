@@ -1,28 +1,21 @@
-// bot.js — multi-tenant WhatsApp bot for Laundry Man
-// Baileys 7.x with correct CommonJS imports + LID debug + restaurant endpoints preserved
+// bot.js — multi-tenant WhatsApp bot for Laundry Man (ESM)
+// Baileys 7.x (ESM-only) + LID debug + restaurant endpoints preserved
 
-const express = require('express');
-const { Boom } = require('@hapi/boom');
-const pino = require('pino');
-const fs = require('fs');
-const path = require('path');
-require('dotenv').config();
+import express from 'express';
+import { Boom } from '@hapi/boom';
+import pino from 'pino';
+import fs from 'fs';
+import path from 'path';
+import dotenv from 'dotenv';
+dotenv.config();
 
-// ============================================================
-// Baileys 7.x is ESM-only. In CommonJS:
-//   - makeWASocket lives on .default
-//   - useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion
-//     are NAMED exports on the module itself (NOT on .default)
-// ============================================================
-const baileys = require('@whiskeysockets/baileys').default;
-const {
-  makeWASocket,
+import makeWASocket, {
   useMultiFileAuthState,
   DisconnectReason,
   fetchLatestBaileysVersion,
-} = baileys;
+} from '@whiskeysockets/baileys';
 
-const { startLaundryQueue } = require('./laundry-queue');
+import { startLaundryQueue } from './laundry-queue.js';
 
 const app = express();
 app.use(express.json());
@@ -34,7 +27,6 @@ const BOT_MODE = (process.env.LM_BOT_MODE || 'shared').trim();
 const AUTH_ROOT = './auth_sessions';
 const SHARED_AUTH_DIR = path.join(AUTH_ROOT, 'shared');
 
-// Render injects RENDER_EXTERNAL_URL at runtime
 const PUBLIC_URL = process.env.RENDER_EXTERNAL_URL
   || process.env.PUBLIC_URL
   || `http://localhost:${PORT}`;
@@ -231,7 +223,6 @@ async function startSharedSession() {
         if (!isUserMessage(msg)) continue;
         storeMessage(msg);
 
-        // DEBUG: full message structure
         try {
           logger.info('[INBOUND-RAW] ' + JSON.stringify({ key: msg.key, message: msg.message }, null, 2));
         } catch (e) {}
@@ -451,8 +442,7 @@ app.get('/', (req, res) => {
     : sharedConnected;
   const tenantsServed = isPerTenantMode() ? perTenantSessions.size : tenantQueues.size;
 
-  res.send(`<!DOCTYPE html>
-<html><head><title>Laundry Man Bot</title><meta name="viewport" content="width=device-width,initial-scale=1">
+  res.send(`<!DOCTYPE html><html><head><title>Laundry Man Bot</title><meta name="viewport" content="width=device-width,initial-scale=1">
 <style>*{margin:0;padding:0;box-sizing:border-box}body{font-family:-apple-system,sans-serif;display:flex;justify-content:center;align-items:center;min-height:100vh;background:linear-gradient(135deg,#0f766e 0%,#115e59 100%);padding:1rem}.c{background:#fff;padding:50px 40px;border-radius:20px;box-shadow:0 20px 60px rgba(0,0,0,.3);text-align:center;max-width:460px;width:100%}.icon{font-size:64px;margin-bottom:20px}h1{color:#1b2b4b;margin-bottom:10px;font-size:28px}p{color:#666;margin-bottom:20px}.status{display:inline-block;padding:8px 20px;border-radius:25px;font-size:14px;font-weight:bold;margin:15px 0}.online{background:#e8f5e9;color:#28a745}.offline{background:#ffeaea;color:#dc3545}.links{margin-top:30px;display:flex;flex-direction:column;gap:10px}.links a{display:block;padding:12px 24px;background:#25D366;color:#fff;text-decoration:none;border-radius:25px;font-weight:600}.links a.health{background:#6c757d}</style></head>
 <body><div class="c"><div class="icon">🧺</div><h1>Laundry Man Bot</h1>
 <p>${isPerTenantMode() ? 'Dedicated' : 'Multi-tenant'} WhatsApp Service</p>

@@ -3,6 +3,7 @@
   "version": "1.0.0",
   "description": "WhatsApp bot for restaurant order confirmations",
   "main": "bot.js",
+  "type": "module",
   "scripts": {
     "start": "node bot.js"
   },
