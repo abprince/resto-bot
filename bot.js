@@ -1,15 +1,6 @@
-// bot.js — multi-tenant WhatsApp bot for Laundry Man (Updated for Baileys 7.x)
-//
-// Modes:
-//   SHARED (default)   — one Baileys session serving all tenants from /node/tenants
-//   PER-TENANT         — LM_TENANTS=1:key,3:key — one session per listed tenant
-//
-// Env:
-//   LM_API_BASE       — PHP API base URL
-//   LM_BOT_MASTER_KEY — master key (required for SHARED mode)
-//   LM_BOT_MODE       — "shared" or "per_tenant" (default: shared)
-//   LM_TENANTS        — comma-separated tenantId:key pairs (PER-TENANT mode)
-//   LM_POLL_MS        — optional, default 30000
+// bot.js — multi-tenant WhatsApp bot for Laundry Man
+// Updated for Baileys 7.x with LID resolution + security patches
+// All original restaurant endpoints and decorative formatting preserved.
 
 const express = require('express');
 const { Boom } = require('@hapi/boom');
@@ -18,7 +9,7 @@ const fs = require('fs');
 const path = require('path');
 require('dotenv').config();
 
-// Baileys 7.x — ESM-only, so use the .default workaround for CommonJS
+// Baileys 7.x — ESM-only, use .default workaround for CommonJS
 const baileys = require('@whiskeysockets/baileys').default;
 const {
   makeWASocket,
@@ -46,7 +37,7 @@ let sharedQr = null;
 const tenantQueues = new Map();
 const perTenantSessions = new Map();
 
-// In-memory message store for getMessage callback (Baileys 7.x)
+// In-memory message store for getMessage callback
 const messageStore = new Map();
 
 // ==================== LOGGER ====================
@@ -72,24 +63,43 @@ function isPerTenantMode() {
   return BOT_MODE === 'per_tenant' && !!(process.env.LM_TENANTS || '').trim();
 }
 
-// Async LID resolution with remoteJidAlt + lidMapping fallback
+/**
+ * Resolve a JID to a phone number.
+ * Handles WhatsApp LID (Linked Device ID) format.
+ */
 async function resolvePhone(msg, sock) {
   const jid = msg.key && msg.key.remoteJid;
 
-  // 1. Prefer remoteJidAlt (real phone number when remoteJid is a LID)
-  if (msg.key && msg.key.remoteJidAlt) {
-    const alt = String(msg.key.remoteJidAlt);
-    const cleaned = alt.split('@')[0].split(':')[0];
+  // 1. senderPn (newest Baileys — direct phone number on message key)
+  if (msg.key && msg.key.senderPn) {
+    const cleaned = String(msg.key.senderPn).split('@')[0].split(':')[0];
+    if (cleaned && cleaned.length >= 8) {
+      if (jid && jid.endsWith('@lid') && sock.signalRepository?.lidMapping?.storeLIDPNMapping) {
+        try { await sock.signalRepository.lidMapping.storeLIDPNMapping(jid, msg.key.senderPn); } catch {}
+      }
+      return cleaned;
+    }
+  }
+
+  // 2. participantPn
+  if (msg.key && msg.key.participantPn) {
+    const cleaned = String(msg.key.participantPn).split('@')[0].split(':')[0];
     if (cleaned && cleaned.length >= 8) return cleaned;
   }
 
-  // 2. If remoteJid is NOT a LID, use it
+  // 3. remoteJidAlt
+  if (msg.key && msg.key.remoteJidAlt) {
+    const cleaned = String(msg.key.remoteJidAlt).split('@')[0].split(':')[0];
+    if (cleaned && cleaned.length >= 8) return cleaned;
+  }
+
+  // 4. remoteJid (if PN, not LID)
   if (jid && !jid.endsWith('@lid')) {
     const cleaned = String(jid).split('@')[0].split(':')[0];
     if (cleaned && cleaned.length >= 8) return cleaned;
   }
 
-  // 3. Fallback: Baileys internal LID mapping store
+  // 5. lidMapping store
   if (jid && jid.endsWith('@lid') && sock.signalRepository?.lidMapping) {
     try {
       const pn = await sock.signalRepository.lidMapping.getPNForLID(jid);
@@ -97,15 +107,11 @@ async function resolvePhone(msg, sock) {
         const cleaned = String(pn).split('@')[0].split(':')[0];
         if (cleaned && cleaned.length >= 8) return cleaned;
       }
-    } catch (err) { /* silent */ }
+    } catch {}
   }
 
-  // 4. Last resort: participant
-  if (msg.key && msg.key.participant) {
-    const part = String(msg.key.participant);
-    const cleaned = part.split('@')[0].split(':')[0];
-    if (cleaned && cleaned.length >= 8) return cleaned;
-  }
+  // 6. Debug dump
+  try { logger.warn('[resolvePhone] Failed. Key: ' + JSON.stringify(msg.key)); } catch {}
 
   return '';
 }
@@ -115,6 +121,7 @@ function extractText(msg) {
   const m = msg.message;
   if (!m) return '';
   let text = '';
+
   if (m.conversation) text = m.conversation;
   if (!text && m.extendedTextMessage) text = m.extendedTextMessage.text || '';
   if (!text && m.imageMessage) text = m.imageMessage.caption || '';
@@ -143,6 +150,7 @@ function extractText(msg) {
     if (inner.conversation) text = inner.conversation;
     if (inner.extendedTextMessage) text = inner.extendedTextMessage.text || '';
   }
+
   return String(text || '').trim();
 }
 
@@ -162,7 +170,7 @@ function isUserMessage(msg) {
   return true;
 }
 
-// Store messages for getMessage callback (retries / quoted replies)
+// Store messages for getMessage callback
 function storeMessage(msg) {
   if (!msg.key || !msg.key.id) return;
   messageStore.set(msg.key.id, msg);
@@ -172,7 +180,7 @@ function storeMessage(msg) {
   }
 }
 
-// ==================== SEND MESSAGE + MEDIA HELPER ====================
+// ==================== SEND MESSAGE + MEDIA ====================
 async function sendMessageWithMedia(sock, phone, text, media) {
   const jid = `${formatPhoneNumber(phone)}@s.whatsapp.net`;
 
@@ -215,7 +223,10 @@ async function startSharedSession() {
 
   sharedSock.ev.on('creds.update', saveCreds);
 
-  // ---- Incoming messages ----
+  sharedSock.ev.on('lid-mapping.update', (update) => {
+    logger.info(`[shared] lid-mapping.update: ${JSON.stringify(update).slice(0, 200)}`);
+  });
+
   sharedSock.ev.on('messages.upsert', async ({ messages, type }) => {
     if (type !== 'notify') return;
     if (messages && messages.some(m => m.requestId)) {
@@ -249,11 +260,7 @@ async function startSharedSession() {
             'X-Bot-Master-Key': MASTER_KEY,
             'Content-Type': 'application/json',
           },
-          body: JSON.stringify({
-            phone,
-            text,
-            message_id: msg.key.id || '',
-          }),
+          body: JSON.stringify({ phone, text, message_id: msg.key.id || '' }),
         });
 
         const json = await res.json().catch(() => ({ ok: false }));
@@ -264,24 +271,17 @@ async function startSharedSession() {
     }
   });
 
-  // ---- Connection lifecycle ----
   sharedSock.ev.on('connection.update', async (update) => {
     const { connection, lastDisconnect, qr } = update;
 
-    if (qr) {
-      sharedQr = qr;
-      logger.info('New QR Code received');
-    }
+    if (qr) { sharedQr = qr; logger.info('New QR Code received'); }
 
     if (connection === 'close') {
       const statusCode = lastDisconnect?.error instanceof Boom
-        ? lastDisconnect.error.output.statusCode
-        : null;
-
+        ? lastDisconnect.error.output.statusCode : null;
       logger.warn(`Connection closed. Status: ${statusCode}`);
       sharedConnected = false;
       sharedQr = null;
-
       if (statusCode !== DisconnectReason.loggedOut) {
         logger.info('Attempting to reconnect...');
         sharedSock = null;
@@ -302,25 +302,18 @@ async function startSharedSession() {
 }
 
 async function syncTenantQueues() {
-  if (!MASTER_KEY) {
-    logger.warn('[shared] no master key — cannot fetch tenants');
-    return;
-  }
-
+  if (!MASTER_KEY) { logger.warn('[shared] no master key'); return; }
   try {
     const url = `${API_BASE}/node/tenants?mode=${encodeURIComponent(BOT_MODE)}`;
     const res = await fetch(url, { headers: { 'X-Bot-Master-Key': MASTER_KEY } });
     const json = await res.json();
     if (!json.ok) throw new Error(json.error || 'Request failed');
-
     const tenants = json.data || [];
     const wanted = new Set(tenants.map(t => t.tenant_id));
-
     for (const t of tenants) {
       if (tenantQueues.has(t.tenant_id)) continue;
       startQueueForTenant(t);
     }
-
     for (const id of [...tenantQueues.keys()]) {
       if (!wanted.has(id)) {
         logger.info(`[shared] tenant ${id} no longer served — stopping queue`);
@@ -336,7 +329,6 @@ async function syncTenantQueues() {
 
 function startQueueForTenant(tenant) {
   logger.info(`[shared] queue started for tenant ${tenant.tenant_id}${tenant.name ? ` (${tenant.name})` : ''}${tenant.is_demo ? ' [DEMO]' : ''}`);
-
   const stop = startLaundryQueue(
     tenant.tenant_id,
     tenant.api_key,
@@ -346,7 +338,6 @@ function startQueueForTenant(tenant) {
     },
     () => sharedConnected
   );
-
   tenantQueues.set(tenant.tenant_id, stop);
 }
 
@@ -363,18 +354,14 @@ function parseTenantList(raw) {
 
 async function startPerTenantSession(tenantId, apiKey) {
   if (perTenantSessions.has(tenantId)) return;
-
   const authDir = path.join(AUTH_ROOT, String(tenantId));
   ensureDir(authDir);
-
   const { state, saveCreds } = await useMultiFileAuthState(authDir);
   const { version } = await fetchLatestBaileysVersion();
-
   logger.info(`[tenant ${tenantId}] starting dedicated session`);
 
   const sock = makeWASocket({
-    version,
-    auth: state,
+    version, auth: state,
     logger: pino({ level: 'silent' }),
     browser: ['Laundry Man Bot', 'Chrome', '1.0.0'],
     getMessage: async (key) => messageStore.get(key.id) || undefined,
@@ -383,8 +370,11 @@ async function startPerTenantSession(tenantId, apiKey) {
 
   const session = { sock, connected: false, qr: null, queueStop: null };
   perTenantSessions.set(tenantId, session);
-
   sock.ev.on('creds.update', saveCreds);
+
+  sock.ev.on('lid-mapping.update', (update) => {
+    logger.info(`[tenant ${tenantId}] lid-mapping.update: ${JSON.stringify(update).slice(0, 200)}`);
+  });
 
   sock.ev.on('messages.upsert', async ({ messages, type }) => {
     if (type !== 'notify') return;
@@ -392,7 +382,6 @@ async function startPerTenantSession(tenantId, apiKey) {
       logger.warn(`[tenant ${tenantId}] Dropped spoofed messages.upsert event`);
       return;
     }
-
     for (const msg of messages) {
       try {
         if (!isUserMessage(msg)) continue;
@@ -405,23 +394,15 @@ async function startPerTenantSession(tenantId, apiKey) {
         }
 
         const text = extractText(msg);
-        if (!text) {
-          const types = Object.keys(msg.message).join(',');
-          logger.info(`[tenant ${tenantId}] inbound from ${phone}: (empty content, types: ${types})`);
-          continue;
-        }
+        if (!text) continue;
 
         logger.info(`[tenant ${tenantId}] inbound from ${phone}: ${text.slice(0, 100)}`);
 
         const res = await fetch(`${API_BASE}/bot/inbound`, {
           method: 'POST',
-          headers: {
-            'X-Bot-Master-Key': MASTER_KEY,
-            'Content-Type': 'application/json',
-          },
+          headers: { 'X-Bot-Master-Key': MASTER_KEY, 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            phone,
-            text,
+            phone, text,
             message_id: msg.key.id || '',
             tenant_id: tenantId,
           }),
@@ -437,15 +418,9 @@ async function startPerTenantSession(tenantId, apiKey) {
 
   sock.ev.on('connection.update', async (update) => {
     const { connection, lastDisconnect, qr } = update;
-
-    if (qr) {
-      session.qr = qr;
-      logger.info(`[tenant ${tenantId}] QR ready — /qr/${tenantId}`);
-    }
-
+    if (qr) { session.qr = qr; logger.info(`[tenant ${tenantId}] QR ready`); }
     if (connection === 'close') {
-      const code = lastDisconnect?.error instanceof Boom
-        ? lastDisconnect.error.output.statusCode : null;
+      const code = lastDisconnect?.error instanceof Boom ? lastDisconnect.error.output.statusCode : null;
       logger.warn(`[tenant ${tenantId}] closed (${code})`);
       session.connected = false;
       session.qr = null;
@@ -459,11 +434,9 @@ async function startPerTenantSession(tenantId, apiKey) {
       logger.info(`[tenant ${tenantId}] ✅ connected`);
       session.connected = true;
       session.qr = null;
-
       if (!session.queueStop) {
         session.queueStop = startLaundryQueue(
-          tenantId,
-          apiKey,
+          tenantId, apiKey,
           async (phone, message, media) => {
             await sendMessageWithMedia(sock, phone, message, media);
           },
@@ -479,10 +452,7 @@ app.get('/', (req, res) => {
   const connected = isPerTenantMode()
     ? [...perTenantSessions.values()].some(s => s.connected)
     : sharedConnected;
-
-  const tenantsServed = isPerTenantMode()
-    ? perTenantSessions.size
-    : tenantQueues.size;
+  const tenantsServed = isPerTenantMode() ? perTenantSessions.size : tenantQueues.size;
 
   res.send(`
   <!DOCTYPE html>
@@ -555,7 +525,6 @@ app.get('/qr', (req, res) => {
     const offline = [...perTenantSessions.entries()].find(([_, s]) => !s.connected);
     if (offline) return res.redirect('/qr/' + offline[0]);
   }
-
   const qrCode = isPerTenantMode() ? null : sharedQr;
   const isConnected = isPerTenantMode()
     ? [...perTenantSessions.values()].every(s => s.connected) && perTenantSessions.size > 0
