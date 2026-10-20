@@ -220,15 +220,25 @@ async function startSharedSession() {
 
     for (const msg of messages) {
       try {
-        if (!isUserMessage(msg)) continue;
-        storeMessage(msg);
+          if (!isUserMessage(msg)) continue;
+          storeMessage(msg);
 
-        // LID fallback — forward empty phone for order-number matching
-        let phone = await resolvePhone(msg, sharedSock);
-        if (!phone) {
-          logger.warn(`[shared] inbound: could not resolve phone from jid=${msg.key.remoteJid} — forwarding for order-number fallback`);
-          phone = '';
-        }
+          try {
+            logger.info(`[tenant ${tenantId}] DEBUG msg.key = ${JSON.stringify(msg.key, null, 2)}`);
+            logger.info(`[tenant ${tenantId}] DEBUG msg.message types = ${Object.keys(msg.message || {}).join(',')}`);
+            if (msg.message?.extendedTextMessage) {
+              logger.info(`[tenant ${tenantId}] DEBUG extendedTextMessage = ${JSON.stringify(msg.message.extendedTextMessage, null, 2)}`);
+            }
+            if (msg.message?.messageContextInfo) {
+              logger.info(`[tenant ${tenantId}] DEBUG messageContextInfo = ${JSON.stringify(msg.message.messageContextInfo, null, 2)}`);
+            }
+          } catch (e) {}
+
+          let phone = await resolvePhone(msg, sock);
+          if (!phone) {
+            logger.warn(`[tenant ${tenantId}] inbound: could not resolve phone from jid=${msg.key.remoteJid} — forwarding for order-number fallback`);
+            phone = '';
+          }
 
         const text = extractText(msg);
         if (!text) {
@@ -369,15 +379,27 @@ async function startPerTenantSession(tenantId, apiKey) {
     }
     for (const msg of messages) {
       try {
-        if (!isUserMessage(msg)) continue;
-        storeMessage(msg);
+          if (!isUserMessage(msg)) continue;
+          storeMessage(msg);
 
-        // LID fallback — forward empty phone for order-number matching
-        let phone = await resolvePhone(msg, sock);
-        if (!phone) {
-          logger.warn(`[tenant ${tenantId}] inbound: could not resolve phone from jid=${msg.key.remoteJid} — forwarding for order-number fallback`);
-          phone = '';
-        }
+          // DEBUG: dump everything Baileys gives us
+          try {
+            logger.info(`[shared] DEBUG msg.key = ${JSON.stringify(msg.key, null, 2)}`);
+            logger.info(`[shared] DEBUG msg.message types = ${Object.keys(msg.message || {}).join(',')}`);
+            if (msg.message?.extendedTextMessage) {
+              logger.info(`[shared] DEBUG extendedTextMessage = ${JSON.stringify(msg.message.extendedTextMessage, null, 2)}`);
+            }
+            if (msg.message?.messageContextInfo) {
+              logger.info(`[shared] DEBUG messageContextInfo = ${JSON.stringify(msg.message.messageContextInfo, null, 2)}`);
+            }
+          } catch (e) {}
+
+          // LID fallback — forward empty phone for order-number matching
+          let phone = await resolvePhone(msg, sharedSock);
+          if (!phone) {
+            logger.warn(`[shared] inbound: could not resolve phone from jid=${msg.key.remoteJid} — forwarding for order-number fallback`);
+            phone = '';
+          }
 
         const text = extractText(msg);
         if (!text) continue;
