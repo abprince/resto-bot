@@ -14,14 +14,13 @@ require('dotenv').config();
 //   - useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion
 //     are NAMED exports on the module itself (NOT on .default)
 // ============================================================
-const baileysModule = require('@whiskeysockets/baileys');
-const baileys = baileysModule.default;
-const makeWASocket = baileys.makeWASocket;
+const baileys = require('@whiskeysockets/baileys').default;
 const {
+  makeWASocket,
   useMultiFileAuthState,
   DisconnectReason,
   fetchLatestBaileysVersion,
-} = baileysModule;
+} = baileys;
 
 const { startLaundryQueue } = require('./laundry-queue');
 
