@@ -66,6 +66,146 @@ function isPerTenantMode() {
   return BOT_MODE === 'per_tenant' && !!(process.env.LM_TENANTS || '').trim();
 }
 
+/**
+ * Resolve a JID to a phone number.
+ * Handles WhatsApp LID (Linked Device ID) format introduced in 2024.
+ *
+ * Priority:
+ *   1. remoteJidAlt (if present — most reliable)
+ *   2. remoteJid (if not @lid)
+ *   3. participant (fallback)
+ */
+function resolvePhone(msg) {
+  const jid = msg.key && msg.key.remoteJid;
+
+  // 1. Prefer remoteJidAlt (contains the real phone for LID messages)
+  if (msg.key && msg.key.remoteJidAlt) {
+    const alt = String(msg.key.remoteJidAlt);
+    const cleaned = alt.split('@')[0].split(':')[0];
+    if (cleaned && cleaned.length >= 8) return cleaned;
+  }
+
+  // 2. Fallback to remoteJid if it's not a LID
+  if (jid && !jid.endsWith('@lid')) {
+    const cleaned = String(jid).split('@')[0].split(':')[0];
+    if (cleaned && cleaned.length >= 8) return cleaned;
+  }
+
+  // 3. Try participant
+  if (msg.key && msg.key.participant) {
+    const part = String(msg.key.participant);
+    const cleaned = part.split('@')[0].split(':')[0];
+    if (cleaned && cleaned.length >= 8) return cleaned;
+  }
+
+  return '';
+}
+
+/**
+ * Extract text content from any WhatsApp message type.
+ * Handles plain text, extended text, captions, buttons, lists, ephemeral, view-once.
+ */
+function extractText(msg) {
+  const m = msg.message;
+  if (!m) return '';
+
+  let text = '';
+
+  if (m.conversation) text = m.conversation;
+  if (!text && m.extendedTextMessage) text = m.extendedTextMessage.text || '';
+  if (!text && m.imageMessage) text = m.imageMessage.caption || '';
+  if (!text && m.videoMessage) text = m.videoMessage.caption || '';
+  if (!text && m.documentMessage) text = m.documentMessage.caption || '';
+  if (!text && m.buttonsResponseMessage) {
+    text = m.buttonsResponseMessage.selectedButtonId ||
+           m.buttonsResponseMessage.selectedDisplayText ||
+           '';
+  }
+  if (!text && m.listResponseMessage) {
+    text = (m.listResponseMessage.singleSelectReply &&
+            m.listResponseMessage.singleSelectReply.selectedRowId) ||
+           m.listResponseMessage.title ||
+           '';
+  }
+  if (!text && m.templateButtonReplyMessage) {
+    text = m.templateButtonReplyMessage.selectedId ||
+           m.templateButtonReplyMessage.selectedDisplayText ||
+           '';
+  }
+  if (!text && m.ephemeralMessage && m.ephemeralMessage.message) {
+    const inner = m.ephemeralMessage.message;
+    if (inner.conversation) text = inner.conversation;
+    if (inner.extendedTextMessage) text = inner.extendedTextMessage.text || '';
+  }
+  if (!text && m.viewOnceMessage && m.viewOnceMessage.message) {
+    const inner = m.viewOnceMessage.message;
+    if (inner.conversation) text = inner.conversation;
+    if (inner.extendedTextMessage) text = inner.extendedTextMessage.text || '';
+  }
+
+  return String(text || '').trim();
+}
+
+/**
+ * Should this incoming message be forwarded to the API?
+ * Skips protocol messages, own messages, status broadcasts, groups.
+ */
+function isUserMessage(msg) {
+  if (!msg.key) return false;
+  if (msg.key.fromMe) return false;
+  if (!msg.message) return false;
+
+  const jid = msg.key.remoteJid;
+  if (!jid) return false;
+  if (jid.endsWith('@g.us')) return false;
+  if (jid === 'status@broadcast') return false;
+
+  // Skip protocol-only messages
+  const m = msg.message;
+  if (!m) return false;
+  if (m.protocolMessage) return false;
+  if (m.senderKeyDistributionMessage) return false;
+
+  return true;
+}
+
+// ==================== SEND MESSAGE + MEDIA HELPER ====================
+/**
+ * Send a message with optional photos.
+ * If photos exist, the first photo gets the full caption (the text).
+ * Remaining photos are sent without caption.
+ * Falls back to text-only if photo fails.
+ */
+async function sendMessageWithMedia(sock, phone, text, media) {
+  const jid = `${formatPhoneNumber(phone)}@s.whatsapp.net`;
+
+  // If no media, just send text
+  if (!Array.isArray(media) || media.length === 0) {
+    await sock.sendMessage(jid, { text });
+    return;
+  }
+
+  // Send photos
+  for (let i = 0; i < media.length; i++) {
+    const m = media[i];
+    const photoUrl = 'https://aramedia.me/laundryman/uploads/qc/' + m.path;
+    const caption = (i === 0) ? text : undefined;
+
+    try {
+      await sock.sendMessage(jid, {
+        image: { url: photoUrl },
+        caption: caption,
+      });
+    } catch (err) {
+      logger.error(`failed to send photo ${i + 1} to ${phone}: ${err.message}`);
+      // If first photo fails, fall back to text
+      if (i === 0) {
+        await sock.sendMessage(jid, { text });
+      }
+    }
+  }
+}
+
 // ==================== SHARED MODE ====================
 async function startSharedSession() {
   if (sharedSock) return;
@@ -84,59 +224,52 @@ async function startSharedSession() {
   });
 
   sharedSock.ev.on('creds.update', saveCreds);
-  
-    // ---- Handle incoming messages (replies from customers) ----
-    sharedSock.ev.on('messages.upsert', async ({ messages, type }) => {
-      if (type !== 'notify') return;
 
-      for (const msg of messages) {
-        try {
-          // Skip own messages and statuses
-          if (msg.key.fromMe) continue;
-          if (!msg.message) continue;
+  // ---- Handle incoming messages ----
+  sharedSock.ev.on('messages.upsert', async ({ messages, type }) => {
+    if (type !== 'notify') return;
 
-          const jid = msg.key.remoteJid;
-          if (!jid || jid.endsWith('@g.us') || jid === 'status@broadcast') continue;
+    for (const msg of messages) {
+      try {
+        if (!isUserMessage(msg)) continue;
 
-          const phone = jid.split('@')[0];
-          const text = (
-            msg.message.conversation ||
-            (msg.message.extendedTextMessage && msg.message.extendedTextMessage.text) ||
-            (msg.message.imageMessage && msg.message.imageMessage.caption) ||
-            (msg.message.buttonsResponseMessage && msg.message.buttonsResponseMessage.selectedButtonId) ||
-            (msg.message.listResponseMessage && msg.message.listResponseMessage.singleSelectReply && msg.message.listResponseMessage.singleSelectReply.selectedRowId) ||
-            ''
-          ).trim();
-
-          if (!text) {
-            logger.info(`[shared] inbound from ${phone}: (non-text message, ignored)`);
-            continue;
-          }
-
-          logger.info(`[shared] inbound from ${phone}: ${text.slice(0, 100)}`);
-
-          // Forward to API
-          const res = await fetch(`${API_BASE}/bot/inbound`, {
-            method: 'POST',
-            headers: {
-              'X-Bot-Master-Key': MASTER_KEY,
-              'Content-Type': 'application/json',
-            },
-            body: JSON.stringify({
-              phone,
-              text,
-              message_id: msg.key.id || '',
-            }),
-          });
-
-          const json = await res.json().catch(() => ({ ok: false }));
-          logger.info(`[shared] inbound result: ${JSON.stringify(json).slice(0, 150)}`);
-        } catch (err) {
-          logger.error(`[shared] inbound handler failed: ${err.message}`);
+        const phone = resolvePhone(msg);
+        if (!phone) {
+          logger.warn(`[shared] inbound: could not resolve phone from jid=${msg.key.remoteJid}`);
+          continue;
         }
-      }
-    });
 
+        const text = extractText(msg);
+        if (!text) {
+          const types = Object.keys(msg.message).join(',');
+          logger.info(`[shared] inbound from ${phone}: (empty content, types: ${types})`);
+          continue;
+        }
+
+        logger.info(`[shared] inbound from ${phone}: ${text.slice(0, 100)}`);
+
+        const res = await fetch(`${API_BASE}/bot/inbound`, {
+          method: 'POST',
+          headers: {
+            'X-Bot-Master-Key': MASTER_KEY,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            phone,
+            text,
+            message_id: msg.key.id || '',
+          }),
+        });
+
+        const json = await res.json().catch(() => ({ ok: false }));
+        logger.info(`[shared] inbound result: ${JSON.stringify(json).slice(0, 200)}`);
+      } catch (err) {
+        logger.error(`[shared] inbound handler failed: ${err.message}`);
+      }
+    }
+  });
+
+  // ---- Connection lifecycle ----
   sharedSock.ev.on('connection.update', async (update) => {
     const { connection, lastDisconnect, qr } = update;
 
@@ -215,32 +348,7 @@ function startQueueForTenant(tenant) {
     tenant.api_key,
     async (phone, message, media) => {
       const text = tenant.is_demo ? `[Demo · ${tenant.name}] ${message}` : message;
-      const jid = `${formatPhoneNumber(phone)}@s.whatsapp.net`;
-
-      // If there are photos, send them with captions
-      if (Array.isArray(media) && media.length > 0) {
-        // First photo gets the full caption; remaining photos get no caption
-        for (let i = 0; i < media.length; i++) {
-          const m = media[i];
-          const photoUrl = 'https://aramedia.me/laundryman/uploads/qc/' + m.path;
-          const caption = (i === 0) ? text : undefined;
-          try {
-            await sharedSock.sendMessage(jid, {
-              image: { url: photoUrl },
-              caption: caption,
-            });
-          } catch (err) {
-            logger.error(`[shared] failed to send photo ${i + 1} to ${phone}: ${err.message}`);
-            // If photo fails, fall back to text
-            if (i === 0) {
-              await sharedSock.sendMessage(jid, { text });
-            }
-          }
-        }
-      } else {
-        // No photos — just text
-        await sharedSock.sendMessage(jid, { text });
-      }
+      await sendMessageWithMedia(sharedSock, phone, text, media);
     },
     () => sharedConnected
   );
@@ -281,53 +389,53 @@ async function startPerTenantSession(tenantId, apiKey) {
   perTenantSessions.set(tenantId, session);
 
   sock.ev.on('creds.update', saveCreds);
-    
-    // ---- Handle incoming messages ----
-    sock.ev.on('messages.upsert', async ({ messages, type }) => {
-      if (type !== 'notify') return;
 
-      for (const msg of messages) {
-        try {
-          if (msg.key.fromMe) continue;
-          if (!msg.message) continue;
+  // ---- Handle incoming messages ----
+  sock.ev.on('messages.upsert', async ({ messages, type }) => {
+    if (type !== 'notify') return;
 
-          const jid = msg.key.remoteJid;
-          if (!jid || jid.endsWith('@g.us') || jid === 'status@broadcast') continue;
+    for (const msg of messages) {
+      try {
+        if (!isUserMessage(msg)) continue;
 
-          const phone = jid.split('@')[0];
-          const text = (
-            msg.message.conversation ||
-            (msg.message.extendedTextMessage && msg.message.extendedTextMessage.text) ||
-            (msg.message.imageMessage && msg.message.imageMessage.caption) ||
-            ''
-          ).trim();
-
-          if (!text) continue;
-
-          logger.info(`[tenant ${tenantId}] inbound from ${phone}: ${text.slice(0, 100)}`);
-
-          const res = await fetch(`${API_BASE}/bot/inbound`, {
-            method: 'POST',
-            headers: {
-              'X-Bot-Master-Key': MASTER_KEY,
-              'Content-Type': 'application/json',
-            },
-            body: JSON.stringify({
-              phone,
-              text,
-              message_id: msg.key.id || '',
-              tenant_id: tenantId,
-            }),
-          });
-
-          const json = await res.json().catch(() => ({ ok: false }));
-          logger.info(`[tenant ${tenantId}] inbound result: ${JSON.stringify(json).slice(0, 150)}`);
-        } catch (err) {
-          logger.error(`[tenant ${tenantId}] inbound handler failed: ${err.message}`);
+        const phone = resolvePhone(msg);
+        if (!phone) {
+          logger.warn(`[tenant ${tenantId}] inbound: could not resolve phone from jid=${msg.key.remoteJid}`);
+          continue;
         }
-      }
-    });
 
+        const text = extractText(msg);
+        if (!text) {
+          const types = Object.keys(msg.message).join(',');
+          logger.info(`[tenant ${tenantId}] inbound from ${phone}: (empty content, types: ${types})`);
+          continue;
+        }
+
+        logger.info(`[tenant ${tenantId}] inbound from ${phone}: ${text.slice(0, 100)}`);
+
+        const res = await fetch(`${API_BASE}/bot/inbound`, {
+          method: 'POST',
+          headers: {
+            'X-Bot-Master-Key': MASTER_KEY,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            phone,
+            text,
+            message_id: msg.key.id || '',
+            tenant_id: tenantId,
+          }),
+        });
+
+        const json = await res.json().catch(() => ({ ok: false }));
+        logger.info(`[tenant ${tenantId}] inbound result: ${JSON.stringify(json).slice(0, 200)}`);
+      } catch (err) {
+        logger.error(`[tenant ${tenantId}] inbound handler failed: ${err.message}`);
+      }
+    }
+  });
+
+  // ---- Connection lifecycle ----
   sock.ev.on('connection.update', async (update) => {
     const { connection, lastDisconnect, qr } = update;
 
@@ -354,35 +462,14 @@ async function startPerTenantSession(tenantId, apiKey) {
       session.qr = null;
 
       if (!session.queueStop) {
-          session.queueStop = startLaundryQueue(
-            tenantId,
-            apiKey,
-            async (phone, message, media) => {
-              const jid = `${formatPhoneNumber(phone)}@s.whatsapp.net`;
-
-              if (Array.isArray(media) && media.length > 0) {
-                for (let i = 0; i < media.length; i++) {
-                  const m = media[i];
-                  const photoUrl = 'https://aramedia.me/laundryman/uploads/qc/' + m.path;
-                  const caption = (i === 0) ? message : undefined;
-                  try {
-                    await sock.sendMessage(jid, {
-                      image: { url: photoUrl },
-                      caption: caption,
-                    });
-                  } catch (err) {
-                    logger.error(`[tenant ${tenantId}] failed photo ${i + 1} to ${phone}: ${err.message}`);
-                    if (i === 0) {
-                      await sock.sendMessage(jid, { text: message });
-                    }
-                  }
-                }
-              } else {
-                await sock.sendMessage(jid, { text: message });
-              }
-            },
-            () => session.connected
-          );
+        session.queueStop = startLaundryQueue(
+          tenantId,
+          apiKey,
+          async (phone, message, media) => {
+            await sendMessageWithMedia(sock, phone, message, media);
+          },
+          () => session.connected
+        );
       }
     }
   });
@@ -690,11 +777,7 @@ app.get('/qr/:tenantId', (req, res) => {
 });
 
 // ==================== HEALTH CHECK ====================
-// Returns JSON for API clients (PHP dashboard, curl, bots).
-// Returns a nice HTML page for browsers.
-// Force a format with ?format=json or ?format=html
 app.get('/health', (req, res) => {
-  // Build the data payload once
   let data;
   if (isPerTenantMode()) {
     const connected = [...perTenantSessions.values()].filter(s => s.connected).length;
@@ -718,7 +801,6 @@ app.get('/health', (req, res) => {
     };
   }
 
-  // Decide format
   const forced = (req.query.format || '').toLowerCase();
   const wantsHtml = forced === 'html'
     || (forced !== 'json' && (req.headers.accept || '').includes('text/html'));
@@ -727,7 +809,6 @@ app.get('/health', (req, res) => {
     return res.json(data);
   }
 
-  // Render HTML page
   const connected = data.whatsapp_connected;
   const uptimeMin = Math.floor(data.uptime / 60);
   const uptimeHr = Math.floor(uptimeMin / 60);
