@@ -84,6 +84,58 @@ async function startSharedSession() {
   });
 
   sharedSock.ev.on('creds.update', saveCreds);
+  
+    // ---- Handle incoming messages (replies from customers) ----
+    sharedSock.ev.on('messages.upsert', async ({ messages, type }) => {
+      if (type !== 'notify') return;
+
+      for (const msg of messages) {
+        try {
+          // Skip own messages and statuses
+          if (msg.key.fromMe) continue;
+          if (!msg.message) continue;
+
+          const jid = msg.key.remoteJid;
+          if (!jid || jid.endsWith('@g.us') || jid === 'status@broadcast') continue;
+
+          const phone = jid.split('@')[0];
+          const text = (
+            msg.message.conversation ||
+            (msg.message.extendedTextMessage && msg.message.extendedTextMessage.text) ||
+            (msg.message.imageMessage && msg.message.imageMessage.caption) ||
+            (msg.message.buttonsResponseMessage && msg.message.buttonsResponseMessage.selectedButtonId) ||
+            (msg.message.listResponseMessage && msg.message.listResponseMessage.singleSelectReply && msg.message.listResponseMessage.singleSelectReply.selectedRowId) ||
+            ''
+          ).trim();
+
+          if (!text) {
+            logger.info(`[shared] inbound from ${phone}: (non-text message, ignored)`);
+            continue;
+          }
+
+          logger.info(`[shared] inbound from ${phone}: ${text.slice(0, 100)}`);
+
+          // Forward to API
+          const res = await fetch(`${API_BASE}/bot/inbound`, {
+            method: 'POST',
+            headers: {
+              'X-Bot-Master-Key': MASTER_KEY,
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+              phone,
+              text,
+              message_id: msg.key.id || '',
+            }),
+          });
+
+          const json = await res.json().catch(() => ({ ok: false }));
+          logger.info(`[shared] inbound result: ${JSON.stringify(json).slice(0, 150)}`);
+        } catch (err) {
+          logger.error(`[shared] inbound handler failed: ${err.message}`);
+        }
+      }
+    });
 
   sharedSock.ev.on('connection.update', async (update) => {
     const { connection, lastDisconnect, qr } = update;
@@ -229,6 +281,52 @@ async function startPerTenantSession(tenantId, apiKey) {
   perTenantSessions.set(tenantId, session);
 
   sock.ev.on('creds.update', saveCreds);
+    
+    // ---- Handle incoming messages ----
+    sock.ev.on('messages.upsert', async ({ messages, type }) => {
+      if (type !== 'notify') return;
+
+      for (const msg of messages) {
+        try {
+          if (msg.key.fromMe) continue;
+          if (!msg.message) continue;
+
+          const jid = msg.key.remoteJid;
+          if (!jid || jid.endsWith('@g.us') || jid === 'status@broadcast') continue;
+
+          const phone = jid.split('@')[0];
+          const text = (
+            msg.message.conversation ||
+            (msg.message.extendedTextMessage && msg.message.extendedTextMessage.text) ||
+            (msg.message.imageMessage && msg.message.imageMessage.caption) ||
+            ''
+          ).trim();
+
+          if (!text) continue;
+
+          logger.info(`[tenant ${tenantId}] inbound from ${phone}: ${text.slice(0, 100)}`);
+
+          const res = await fetch(`${API_BASE}/bot/inbound`, {
+            method: 'POST',
+            headers: {
+              'X-Bot-Master-Key': MASTER_KEY,
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+              phone,
+              text,
+              message_id: msg.key.id || '',
+              tenant_id: tenantId,
+            }),
+          });
+
+          const json = await res.json().catch(() => ({ ok: false }));
+          logger.info(`[tenant ${tenantId}] inbound result: ${JSON.stringify(json).slice(0, 150)}`);
+        } catch (err) {
+          logger.error(`[tenant ${tenantId}] inbound handler failed: ${err.message}`);
+        }
+      }
+    });
 
   sock.ev.on('connection.update', async (update) => {
     const { connection, lastDisconnect, qr } = update;
