@@ -1,4 +1,4 @@
-// bot.js — multi-tenant WhatsApp bot for Laundry Man
+// bot.js — multi-tenant WhatsApp bot for Laundry Man (Updated for Baileys 7.x)
 //
 // Modes:
 //   SHARED (default)   — one Baileys session serving all tenants from /node/tenants
@@ -12,17 +12,20 @@
 //   LM_POLL_MS        — optional, default 30000
 
 const express = require('express');
-const {
-  makeWASocket,
-  useMultiFileAuthState,
-  DisconnectReason,
-  fetchLatestBaileysVersion,
-} = require('@whiskeysockets/baileys');
 const { Boom } = require('@hapi/boom');
 const pino = require('pino');
 const fs = require('fs');
 const path = require('path');
 require('dotenv').config();
+
+// Baileys 7.x — ESM-only, so use the .default workaround for CommonJS
+const baileys = require('@whiskeysockets/baileys').default;
+const {
+  makeWASocket,
+  useMultiFileAuthState,
+  DisconnectReason,
+  fetchLatestBaileysVersion,
+} = baileys;
 
 const { startLaundryQueue } = require('./laundry-queue');
 
@@ -42,6 +45,9 @@ let sharedConnected = false;
 let sharedQr = null;
 const tenantQueues = new Map();
 const perTenantSessions = new Map();
+
+// In-memory message store for getMessage callback (Baileys 7.x)
+const messageStore = new Map();
 
 // ==================== LOGGER ====================
 const logger = pino({
@@ -66,32 +72,35 @@ function isPerTenantMode() {
   return BOT_MODE === 'per_tenant' && !!(process.env.LM_TENANTS || '').trim();
 }
 
-/**
- * Resolve a JID to a phone number.
- * Handles WhatsApp LID (Linked Device ID) format introduced in 2024.
- *
- * Priority:
- *   1. remoteJidAlt (if present — most reliable)
- *   2. remoteJid (if not @lid)
- *   3. participant (fallback)
- */
-function resolvePhone(msg) {
+// Async LID resolution with remoteJidAlt + lidMapping fallback
+async function resolvePhone(msg, sock) {
   const jid = msg.key && msg.key.remoteJid;
 
-  // 1. Prefer remoteJidAlt (contains the real phone for LID messages)
+  // 1. Prefer remoteJidAlt (real phone number when remoteJid is a LID)
   if (msg.key && msg.key.remoteJidAlt) {
     const alt = String(msg.key.remoteJidAlt);
     const cleaned = alt.split('@')[0].split(':')[0];
     if (cleaned && cleaned.length >= 8) return cleaned;
   }
 
-  // 2. Fallback to remoteJid if it's not a LID
+  // 2. If remoteJid is NOT a LID, use it
   if (jid && !jid.endsWith('@lid')) {
     const cleaned = String(jid).split('@')[0].split(':')[0];
     if (cleaned && cleaned.length >= 8) return cleaned;
   }
 
-  // 3. Try participant
+  // 3. Fallback: Baileys internal LID mapping store
+  if (jid && jid.endsWith('@lid') && sock.signalRepository?.lidMapping) {
+    try {
+      const pn = await sock.signalRepository.lidMapping.getPNForLID(jid);
+      if (pn) {
+        const cleaned = String(pn).split('@')[0].split(':')[0];
+        if (cleaned && cleaned.length >= 8) return cleaned;
+      }
+    } catch (err) { /* silent */ }
+  }
+
+  // 4. Last resort: participant
   if (msg.key && msg.key.participant) {
     const part = String(msg.key.participant);
     const cleaned = part.split('@')[0].split(':')[0];
@@ -101,16 +110,11 @@ function resolvePhone(msg) {
   return '';
 }
 
-/**
- * Extract text content from any WhatsApp message type.
- * Handles plain text, extended text, captions, buttons, lists, ephemeral, view-once.
- */
+// Extract text from any message type
 function extractText(msg) {
   const m = msg.message;
   if (!m) return '';
-
   let text = '';
-
   if (m.conversation) text = m.conversation;
   if (!text && m.extendedTextMessage) text = m.extendedTextMessage.text || '';
   if (!text && m.imageMessage) text = m.imageMessage.caption || '';
@@ -118,19 +122,16 @@ function extractText(msg) {
   if (!text && m.documentMessage) text = m.documentMessage.caption || '';
   if (!text && m.buttonsResponseMessage) {
     text = m.buttonsResponseMessage.selectedButtonId ||
-           m.buttonsResponseMessage.selectedDisplayText ||
-           '';
+           m.buttonsResponseMessage.selectedDisplayText || '';
   }
   if (!text && m.listResponseMessage) {
     text = (m.listResponseMessage.singleSelectReply &&
             m.listResponseMessage.singleSelectReply.selectedRowId) ||
-           m.listResponseMessage.title ||
-           '';
+           m.listResponseMessage.title || '';
   }
   if (!text && m.templateButtonReplyMessage) {
     text = m.templateButtonReplyMessage.selectedId ||
-           m.templateButtonReplyMessage.selectedDisplayText ||
-           '';
+           m.templateButtonReplyMessage.selectedDisplayText || '';
   }
   if (!text && m.ephemeralMessage && m.ephemeralMessage.message) {
     const inner = m.ephemeralMessage.message;
@@ -142,66 +143,53 @@ function extractText(msg) {
     if (inner.conversation) text = inner.conversation;
     if (inner.extendedTextMessage) text = inner.extendedTextMessage.text || '';
   }
-
   return String(text || '').trim();
 }
 
-/**
- * Should this incoming message be forwarded to the API?
- * Skips protocol messages, own messages, status broadcasts, groups.
- */
+// Skip protocol / own / group / status messages
 function isUserMessage(msg) {
   if (!msg.key) return false;
   if (msg.key.fromMe) return false;
   if (!msg.message) return false;
-
   const jid = msg.key.remoteJid;
   if (!jid) return false;
   if (jid.endsWith('@g.us')) return false;
   if (jid === 'status@broadcast') return false;
-
-  // Skip protocol-only messages
   const m = msg.message;
   if (!m) return false;
   if (m.protocolMessage) return false;
   if (m.senderKeyDistributionMessage) return false;
-
   return true;
 }
 
+// Store messages for getMessage callback (retries / quoted replies)
+function storeMessage(msg) {
+  if (!msg.key || !msg.key.id) return;
+  messageStore.set(msg.key.id, msg);
+  if (messageStore.size > 1000) {
+    const keys = [...messageStore.keys()];
+    keys.slice(0, 500).forEach(k => messageStore.delete(k));
+  }
+}
+
 // ==================== SEND MESSAGE + MEDIA HELPER ====================
-/**
- * Send a message with optional photos.
- * If photos exist, the first photo gets the full caption (the text).
- * Remaining photos are sent without caption.
- * Falls back to text-only if photo fails.
- */
 async function sendMessageWithMedia(sock, phone, text, media) {
   const jid = `${formatPhoneNumber(phone)}@s.whatsapp.net`;
 
-  // If no media, just send text
   if (!Array.isArray(media) || media.length === 0) {
     await sock.sendMessage(jid, { text });
     return;
   }
 
-  // Send photos
   for (let i = 0; i < media.length; i++) {
     const m = media[i];
     const photoUrl = 'https://aramedia.me/laundryman/uploads/qc/' + m.path;
     const caption = (i === 0) ? text : undefined;
-
     try {
-      await sock.sendMessage(jid, {
-        image: { url: photoUrl },
-        caption: caption,
-      });
+      await sock.sendMessage(jid, { image: { url: photoUrl }, caption });
     } catch (err) {
       logger.error(`failed to send photo ${i + 1} to ${phone}: ${err.message}`);
-      // If first photo fails, fall back to text
-      if (i === 0) {
-        await sock.sendMessage(jid, { text });
-      }
+      if (i === 0) await sock.sendMessage(jid, { text });
     }
   }
 }
@@ -221,19 +209,26 @@ async function startSharedSession() {
     auth: state,
     logger: pino({ level: 'silent' }),
     browser: ['Laundry Man Bot', 'Chrome', '1.0.0'],
+    getMessage: async (key) => messageStore.get(key.id) || undefined,
+    shouldSyncHistoryMessage: () => false,
   });
 
   sharedSock.ev.on('creds.update', saveCreds);
 
-  // ---- Handle incoming messages ----
+  // ---- Incoming messages ----
   sharedSock.ev.on('messages.upsert', async ({ messages, type }) => {
     if (type !== 'notify') return;
+    if (messages && messages.some(m => m.requestId)) {
+      logger.warn('[shared] Dropped spoofed messages.upsert event');
+      return;
+    }
 
     for (const msg of messages) {
       try {
         if (!isUserMessage(msg)) continue;
+        storeMessage(msg);
 
-        const phone = resolvePhone(msg);
+        const phone = await resolvePhone(msg, sharedSock);
         if (!phone) {
           logger.warn(`[shared] inbound: could not resolve phone from jid=${msg.key.remoteJid}`);
           continue;
@@ -301,7 +296,6 @@ async function startSharedSession() {
       logger.info('✅ WhatsApp connected successfully!');
       sharedConnected = true;
       sharedQr = null;
-
       await syncTenantQueues();
     }
   });
@@ -383,6 +377,8 @@ async function startPerTenantSession(tenantId, apiKey) {
     auth: state,
     logger: pino({ level: 'silent' }),
     browser: ['Laundry Man Bot', 'Chrome', '1.0.0'],
+    getMessage: async (key) => messageStore.get(key.id) || undefined,
+    shouldSyncHistoryMessage: () => false,
   });
 
   const session = { sock, connected: false, qr: null, queueStop: null };
@@ -390,15 +386,19 @@ async function startPerTenantSession(tenantId, apiKey) {
 
   sock.ev.on('creds.update', saveCreds);
 
-  // ---- Handle incoming messages ----
   sock.ev.on('messages.upsert', async ({ messages, type }) => {
     if (type !== 'notify') return;
+    if (messages && messages.some(m => m.requestId)) {
+      logger.warn(`[tenant ${tenantId}] Dropped spoofed messages.upsert event`);
+      return;
+    }
 
     for (const msg of messages) {
       try {
         if (!isUserMessage(msg)) continue;
+        storeMessage(msg);
 
-        const phone = resolvePhone(msg);
+        const phone = await resolvePhone(msg, sock);
         if (!phone) {
           logger.warn(`[tenant ${tenantId}] inbound: could not resolve phone from jid=${msg.key.remoteJid}`);
           continue;
@@ -435,7 +435,6 @@ async function startPerTenantSession(tenantId, apiKey) {
     }
   });
 
-  // ---- Connection lifecycle ----
   sock.ev.on('connection.update', async (update) => {
     const { connection, lastDisconnect, qr } = update;
 
