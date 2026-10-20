@@ -1,6 +1,5 @@
 // bot.js — multi-tenant WhatsApp bot for Laundry Man
-// Updated for Baileys 7.x with LID resolution + security patches
-// All original restaurant endpoints and decorative formatting preserved.
+// Baileys 7.x + LID fallback via order number matching + original restaurant formatting
 
 const express = require('express');
 const { Boom } = require('@hapi/boom');
@@ -9,14 +8,15 @@ const fs = require('fs');
 const path = require('path');
 require('dotenv').config();
 
-// Baileys 7.x — ESM-only, use .default workaround for CommonJS
-const baileys = require('@whiskeysockets/baileys').default;
+// Baileys 7.x — ESM-only. Named exports on module, makeWASocket on .default
+const baileysModule = require('@whiskeysockets/baileys');
+const baileys = baileysModule.default;
+const makeWASocket = baileys.makeWASocket;
 const {
-  makeWASocket,
   useMultiFileAuthState,
   DisconnectReason,
   fetchLatestBaileysVersion,
-} = baileys;
+} = baileysModule;
 
 const { startLaundryQueue } = require('./laundry-queue');
 
@@ -36,8 +36,6 @@ let sharedConnected = false;
 let sharedQr = null;
 const tenantQueues = new Map();
 const perTenantSessions = new Map();
-
-// In-memory message store for getMessage callback
 const messageStore = new Map();
 
 // ==================== LOGGER ====================
@@ -63,14 +61,9 @@ function isPerTenantMode() {
   return BOT_MODE === 'per_tenant' && !!(process.env.LM_TENANTS || '').trim();
 }
 
-/**
- * Resolve a JID to a phone number.
- * Handles WhatsApp LID (Linked Device ID) format.
- */
 async function resolvePhone(msg, sock) {
   const jid = msg.key && msg.key.remoteJid;
 
-  // 1. senderPn (newest Baileys — direct phone number on message key)
   if (msg.key && msg.key.senderPn) {
     const cleaned = String(msg.key.senderPn).split('@')[0].split(':')[0];
     if (cleaned && cleaned.length >= 8) {
@@ -81,25 +74,21 @@ async function resolvePhone(msg, sock) {
     }
   }
 
-  // 2. participantPn
   if (msg.key && msg.key.participantPn) {
     const cleaned = String(msg.key.participantPn).split('@')[0].split(':')[0];
     if (cleaned && cleaned.length >= 8) return cleaned;
   }
 
-  // 3. remoteJidAlt
   if (msg.key && msg.key.remoteJidAlt) {
     const cleaned = String(msg.key.remoteJidAlt).split('@')[0].split(':')[0];
     if (cleaned && cleaned.length >= 8) return cleaned;
   }
 
-  // 4. remoteJid (if PN, not LID)
   if (jid && !jid.endsWith('@lid')) {
     const cleaned = String(jid).split('@')[0].split(':')[0];
     if (cleaned && cleaned.length >= 8) return cleaned;
   }
 
-  // 5. lidMapping store
   if (jid && jid.endsWith('@lid') && sock.signalRepository?.lidMapping) {
     try {
       const pn = await sock.signalRepository.lidMapping.getPNForLID(jid);
@@ -110,13 +99,10 @@ async function resolvePhone(msg, sock) {
     } catch {}
   }
 
-  // 6. Debug dump
   try { logger.warn('[resolvePhone] Failed. Key: ' + JSON.stringify(msg.key)); } catch {}
-
   return '';
 }
 
-// Extract text from any message type
 function extractText(msg) {
   const m = msg.message;
   if (!m) return '';
@@ -154,7 +140,6 @@ function extractText(msg) {
   return String(text || '').trim();
 }
 
-// Skip protocol / own / group / status messages
 function isUserMessage(msg) {
   if (!msg.key) return false;
   if (msg.key.fromMe) return false;
@@ -170,7 +155,6 @@ function isUserMessage(msg) {
   return true;
 }
 
-// Store messages for getMessage callback
 function storeMessage(msg) {
   if (!msg.key || !msg.key.id) return;
   messageStore.set(msg.key.id, msg);
@@ -239,20 +223,21 @@ async function startSharedSession() {
         if (!isUserMessage(msg)) continue;
         storeMessage(msg);
 
-        const phone = await resolvePhone(msg, sharedSock);
+        // LID fallback — forward empty phone for order-number matching
+        let phone = await resolvePhone(msg, sharedSock);
         if (!phone) {
-          logger.warn(`[shared] inbound: could not resolve phone from jid=${msg.key.remoteJid}`);
-          continue;
+          logger.warn(`[shared] inbound: could not resolve phone from jid=${msg.key.remoteJid} — forwarding for order-number fallback`);
+          phone = '';
         }
 
         const text = extractText(msg);
         if (!text) {
           const types = Object.keys(msg.message).join(',');
-          logger.info(`[shared] inbound from ${phone}: (empty content, types: ${types})`);
+          logger.info(`[shared] inbound from ${phone || 'LID'}: (empty content, types: ${types})`);
           continue;
         }
 
-        logger.info(`[shared] inbound from ${phone}: ${text.slice(0, 100)}`);
+        logger.info(`[shared] inbound from ${phone || 'LID'}: ${text.slice(0, 100)}`);
 
         const res = await fetch(`${API_BASE}/bot/inbound`, {
           method: 'POST',
@@ -387,16 +372,17 @@ async function startPerTenantSession(tenantId, apiKey) {
         if (!isUserMessage(msg)) continue;
         storeMessage(msg);
 
-        const phone = await resolvePhone(msg, sock);
+        // LID fallback — forward empty phone for order-number matching
+        let phone = await resolvePhone(msg, sock);
         if (!phone) {
-          logger.warn(`[tenant ${tenantId}] inbound: could not resolve phone from jid=${msg.key.remoteJid}`);
-          continue;
+          logger.warn(`[tenant ${tenantId}] inbound: could not resolve phone from jid=${msg.key.remoteJid} — forwarding for order-number fallback`);
+          phone = '';
         }
 
         const text = extractText(msg);
         if (!text) continue;
 
-        logger.info(`[tenant ${tenantId}] inbound from ${phone}: ${text.slice(0, 100)}`);
+        logger.info(`[tenant ${tenantId}] inbound from ${phone || 'LID'}: ${text.slice(0, 100)}`);
 
         const res = await fetch(`${API_BASE}/bot/inbound`, {
           method: 'POST',
@@ -806,47 +792,20 @@ app.get('/health', (req, res) => {
       .icon { font-size: 64px; margin-bottom: 20px; }
       h1 { color: #1b2b4b; margin-bottom: 10px; font-size: 26px; }
       p.subtitle { color: #666; margin-bottom: 20px; }
-
-      .status {
-        display: inline-block; padding: 10px 24px; border-radius: 25px;
-        font-size: 15px; font-weight: bold; margin: 15px 0 25px;
-      }
+      .status { display: inline-block; padding: 10px 24px; border-radius: 25px; font-size: 15px; font-weight: bold; margin: 15px 0 25px; }
       .online { background: #e8f5e9; color: #28a745; }
       .offline { background: #ffeaea; color: #dc3545; }
-
-      .stats {
-        display: grid; gap: .5rem; margin-bottom: 25px; text-align: left;
-      }
-      .stat-row {
-        display: flex; justify-content: space-between; align-items: center;
-        padding: .6rem .9rem; background: #f8fafc; border-radius: 10px;
-        font-size: 14px;
-      }
-      .stat-row .label {
-        color: #94a3b8; font-weight: 600; text-transform: uppercase;
-        letter-spacing: .03em; font-size: 12px;
-      }
-      .stat-row .value {
-        color: #1b2b4b; font-weight: 700; font-family: ui-monospace, monospace;
-        font-size: 13px;
-      }
-
+      .stats { display: grid; gap: .5rem; margin-bottom: 25px; text-align: left; }
+      .stat-row { display: flex; justify-content: space-between; align-items: center; padding: .6rem .9rem; background: #f8fafc; border-radius: 10px; font-size: 14px; }
+      .stat-row .label { color: #94a3b8; font-weight: 600; text-transform: uppercase; letter-spacing: .03em; font-size: 12px; }
+      .stat-row .value { color: #1b2b4b; font-weight: 700; font-family: ui-monospace, monospace; font-size: 13px; }
       .links { display: flex; flex-direction: column; gap: 10px; margin-top: 15px; }
-      .links a {
-        display: block; padding: 12px 24px; background: #0f766e; color: white;
-        text-decoration: none; border-radius: 25px; font-weight: 600;
-        transition: all 0.3s;
-      }
+      .links a { display: block; padding: 12px 24px; background: #0f766e; color: white; text-decoration: none; border-radius: 25px; font-weight: 600; transition: all 0.3s; }
       .links a:hover { background: #115e59; transform: translateY(-2px); }
       .links a.home { background: #6c757d; }
       .links a.home:hover { background: #5a6268; }
-
-      .refresh {
-        font-size: 12px; color: #94a3b8; margin-top: 20px;
-      }
+      .refresh { font-size: 12px; color: #94a3b8; margin-top: 20px; }
       .refresh a { color: #0f766e; text-decoration: none; font-weight: 600; }
-      .refresh a:hover { text-decoration: underline; }
-
       .footer { margin-top: 20px; font-size: 11px; color: #cbd5e1; }
     </style>
   </head>
@@ -855,50 +814,23 @@ app.get('/health', (req, res) => {
       <div class="icon">${connected ? '✅' : '⚠️'}</div>
       <h1>Bot Health</h1>
       <p class="subtitle">Laundry Man WhatsApp Service</p>
-
       <span class="status ${connected ? 'online' : 'offline'}">
         ${connected ? '🟢 Connected' : '🔴 Disconnected'}
       </span>
-
       <div class="stats">
-        <div class="stat-row">
-          <span class="label">Status</span>
-          <span class="value">${data.status}</span>
-        </div>
-        <div class="stat-row">
-          <span class="label">Mode</span>
-          <span class="value">${data.mode}</span>
-        </div>
-        <div class="stat-row">
-          <span class="label">WhatsApp</span>
-          <span class="value" style="color:${connected ? '#28a745' : '#dc3545'}">
-            ${connected ? 'Connected' : 'Disconnected'}
-          </span>
-        </div>
+        <div class="stat-row"><span class="label">Status</span><span class="value">${data.status}</span></div>
+        <div class="stat-row"><span class="label">Mode</span><span class="value">${data.mode}</span></div>
+        <div class="stat-row"><span class="label">WhatsApp</span><span class="value" style="color:${connected ? '#28a745' : '#dc3545'}">${connected ? 'Connected' : 'Disconnected'}</span></div>
         ${data.mode === 'shared'
-          ? `<div class="stat-row">
-              <span class="label">Tenants served</span>
-              <span class="value">${data.tenants_served}</span>
-            </div>`
-          : `<div class="stat-row">
-              <span class="label">Tenants connected</span>
-              <span class="value">${data.tenants_connected} / ${data.tenants_total}</span>
-            </div>`}
-        <div class="stat-row">
-          <span class="label">Uptime</span>
-          <span class="value">${uptimeStr}</span>
-        </div>
-        <div class="stat-row">
-          <span class="label">Checked at</span>
-          <span class="value">${data.timestamp.slice(11, 19)} UTC</span>
-        </div>
+          ? `<div class="stat-row"><span class="label">Tenants served</span><span class="value">${data.tenants_served}</span></div>`
+          : `<div class="stat-row"><span class="label">Tenants connected</span><span class="value">${data.tenants_connected} / ${data.tenants_total}</span></div>`}
+        <div class="stat-row"><span class="label">Uptime</span><span class="value">${uptimeStr}</span></div>
+        <div class="stat-row"><span class="label">Checked at</span><span class="value">${data.timestamp.slice(11, 19)} UTC</span></div>
       </div>
-
       <div class="links">
         ${!connected ? `<a href="/qr">📱 Scan QR to Connect</a>` : ''}
         <a href="/" class="home">🏠 Back to Home</a>
       </div>
-
       <p class="refresh">
         <a href="/health?format=html">🔄 Refresh</a> ·
         <a href="/health?format=json">View raw JSON</a>
@@ -928,7 +860,7 @@ app.get('/status', (req, res) => {
   });
 });
 
-// ==================== RESTAURANT BOT ENDPOINTS (kept for compatibility) ====================
+// ==================== RESTAURANT BOT ENDPOINTS ====================
 async function sendWhatsAppMessage(phoneNumber, message) {
   try {
     const sock = isPerTenantMode()
@@ -1015,11 +947,17 @@ app.post('/send-update', async (req, res) => {
 });
 
 // ==================== START SERVER ====================
+// Render sets RENDER_EXTERNAL_URL automatically (e.g. https://resto-bot-ep2n.onrender.com)
+// Fall back to localhost only when running locally
+const PUBLIC_URL = process.env.RENDER_EXTERNAL_URL
+  || process.env.PUBLIC_URL
+  || `http://localhost:${PORT}`;
+
 app.listen(PORT, async () => {
   logger.info(`🚀 Laundry Man Bot server running on port ${PORT}`);
-  logger.info(`📍 Homepage: http://localhost:${PORT}`);
-  logger.info(`📱 QR Code: http://localhost:${PORT}/qr`);
-  logger.info(`❤️  Health: http://localhost:${PORT}/health`);
+  logger.info(`📍 Homepage: ${PUBLIC_URL}/`);
+  logger.info(`📱 QR Code: ${PUBLIC_URL}/qr`);
+  logger.info(`❤️  Health: ${PUBLIC_URL}/health`);
 
   if (isPerTenantMode()) {
     const list = parseTenantList(process.env.LM_TENANTS);
@@ -1038,7 +976,6 @@ app.listen(PORT, async () => {
   }
 });
 
-// Graceful shutdown
 process.on('SIGINT', async () => {
   logger.info('Shutting down...');
   for (const stop of tenantQueues.values()) stop();
