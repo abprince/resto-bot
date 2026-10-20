@@ -28,32 +28,33 @@ function startLaundryQueue(tenantId, apiKey, sendText, isReady = () => true) {
 
   let stopped = false, busy = false, failures = 0;
 
-  async function tick() {
-    if (stopped || busy || !isReady()) return;
-    busy = true;
-    try {
-      const messages = await api(`/node/pending?limit=${BATCH_LIMIT}`);
-      failures = 0;
-      for (const m of messages) {
-        if (stopped || !isReady()) break;
+    async function tick() {
+        if (stopped || busy || !isReady()) return;
+        busy = true;
         try {
-          await sendText(String(m.phone), m.message);
-          await api(`/node/${m.id}/sent`, 'POST');
-          console.log(`${logPrefix} sent #${m.id} (${m.type})`);
+          const messages = await api(`/node/pending?limit=${BATCH_LIMIT}`);
+          failures = 0;
+          for (const m of messages) {
+            if (stopped || !isReady()) break;
+            try {
+              const media = m.media ? (typeof m.media === 'string' ? JSON.parse(m.media) : m.media) : [];
+              await sendText(String(m.phone), m.message, media);
+              await api(`/node/${m.id}/sent`, 'POST');
+              console.log(`${logPrefix} sent #${m.id} (${m.type})${media.length ? ' + ' + media.length + ' photo(s)' : ''}`);
+            } catch (e) {
+              console.error(`${logPrefix} failed #${m.id}:`, e.message);
+              await api(`/node/${m.id}/failed`, 'POST', { error: String(e.message || e) }).catch(() => {});
+            }
+            await sleep(2000 + Math.random() * 1500);
+          }
         } catch (e) {
-          console.error(`${logPrefix} failed #${m.id}:`, e.message);
-          await api(`/node/${m.id}/failed`, 'POST', { error: String(e.message || e) }).catch(() => {});
+          failures++;
+          console.error(`${logPrefix} poll error:`, e.message);
+          await sleep(Math.min(60000, failures * 5000));
+        } finally {
+          busy = false;
         }
-        await sleep(2000 + Math.random() * 1500);
       }
-    } catch (e) {
-      failures++;
-      console.error(`${logPrefix} poll error:`, e.message);
-      await sleep(Math.min(60000, failures * 5000));
-    } finally {
-      busy = false;
-    }
-  }
 
   const timer = setInterval(tick, POLL_MS);
   tick();

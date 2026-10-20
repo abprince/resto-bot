@@ -161,10 +161,34 @@ function startQueueForTenant(tenant) {
   const stop = startLaundryQueue(
     tenant.tenant_id,
     tenant.api_key,
-    async (phone, message) => {
+    async (phone, message, media) => {
       const text = tenant.is_demo ? `[Demo · ${tenant.name}] ${message}` : message;
       const jid = `${formatPhoneNumber(phone)}@s.whatsapp.net`;
-      await sharedSock.sendMessage(jid, { text });
+
+      // If there are photos, send them with captions
+      if (Array.isArray(media) && media.length > 0) {
+        // First photo gets the full caption; remaining photos get no caption
+        for (let i = 0; i < media.length; i++) {
+          const m = media[i];
+          const photoUrl = 'https://aramedia.me/laundryman/uploads/qc/' + m.path;
+          const caption = (i === 0) ? text : undefined;
+          try {
+            await sharedSock.sendMessage(jid, {
+              image: { url: photoUrl },
+              caption: caption,
+            });
+          } catch (err) {
+            logger.error(`[shared] failed to send photo ${i + 1} to ${phone}: ${err.message}`);
+            // If photo fails, fall back to text
+            if (i === 0) {
+              await sharedSock.sendMessage(jid, { text });
+            }
+          }
+        }
+      } else {
+        // No photos — just text
+        await sharedSock.sendMessage(jid, { text });
+      }
     },
     () => sharedConnected
   );
@@ -232,15 +256,35 @@ async function startPerTenantSession(tenantId, apiKey) {
       session.qr = null;
 
       if (!session.queueStop) {
-        session.queueStop = startLaundryQueue(
-          tenantId,
-          apiKey,
-          async (phone, message) => {
-            const jid = `${formatPhoneNumber(phone)}@s.whatsapp.net`;
-            await sock.sendMessage(jid, { text: message });
-          },
-          () => session.connected
-        );
+          session.queueStop = startLaundryQueue(
+            tenantId,
+            apiKey,
+            async (phone, message, media) => {
+              const jid = `${formatPhoneNumber(phone)}@s.whatsapp.net`;
+
+              if (Array.isArray(media) && media.length > 0) {
+                for (let i = 0; i < media.length; i++) {
+                  const m = media[i];
+                  const photoUrl = 'https://aramedia.me/laundryman/uploads/qc/' + m.path;
+                  const caption = (i === 0) ? message : undefined;
+                  try {
+                    await sock.sendMessage(jid, {
+                      image: { url: photoUrl },
+                      caption: caption,
+                    });
+                  } catch (err) {
+                    logger.error(`[tenant ${tenantId}] failed photo ${i + 1} to ${phone}: ${err.message}`);
+                    if (i === 0) {
+                      await sock.sendMessage(jid, { text: message });
+                    }
+                  }
+                }
+              } else {
+                await sock.sendMessage(jid, { text: message });
+              }
+            },
+            () => session.connected
+          );
       }
     }
   });
